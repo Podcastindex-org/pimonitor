@@ -1,5 +1,6 @@
 use std::io::IsTerminal as _; // for stdout().is_terminal()
 use std::time::Duration;
+use std::{fs::File, path::PathBuf};
 
 use anyhow::Result;
 use chrono::{DateTime, Local};
@@ -10,10 +11,23 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{BarChart, Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Terminal;
 use serde::Deserialize;
 use serde_json::Value;
+use quick_xml::events::Event as XmlEvent;
+use quick_xml::Reader as XmlReader;
+use rodio::{OutputStream, Sink, Source};
+use rustfft::{num_complex::Complex32, FftPlanner};
+use symphonia::core::audio::{AudioBufferRef, Signal};
+use symphonia::core::codecs::DecoderOptions;
+use symphonia::core::errors::Error as SymphoniaError;
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
+use symphonia::core::sample::Sample;
+use symphonia::default::get_probe;
 use tokio::sync::mpsc;
 use tokio::time::interval;
 
@@ -60,15 +74,28 @@ enum DataSource {
     Empty,
 }
 
-#[derive(Debug, Clone)]
+// Do not derive Debug/Clone because we hold non-Clone, non-Debug audio handles
 struct AppState {
     feeds: Vec<Feed>,
     scroll: usize,
     selected: usize,
-    last_updated: Option<DateTime<Local>>,
+    last_updated: Option<DateTime<Local>>, 
     source: DataSource,
     status_msg: String,
     show_popup: bool,
+    // XML viewer state
+    xml_show: bool,
+    xml_text: String,
+    // Modal scroll state
+    xml_scroll: u16,
+    popup_scroll: u16,
+    // Audio playback state
+    audio_stream: Option<OutputStream>,
+    audio_sink: Option<Sink>,
+    temp_audio_path: Option<PathBuf>,
+    // EQ UI state
+    eq_levels: [f32; 12],
+    eq_visible: bool,
 }
 
 impl AppState {
@@ -81,7 +108,38 @@ impl AppState {
             source: DataSource::Empty,
             status_msg: String::from("Press q to quit. Fetching…"),
             show_popup: false,
+            xml_show: false,
+            xml_text: String::new(),
+            xml_scroll: 0,
+            popup_scroll: 0,
+            audio_stream: None,
+            audio_sink: None,
+            temp_audio_path: None,
+            eq_levels: [0.0; 12],
+            eq_visible: false,
         }
+    }
+
+    fn is_playing(&self) -> bool {
+        self.audio_sink
+            .as_ref()
+            .map(|s| !s.is_paused())
+            .unwrap_or(false)
+            && self.audio_sink.as_ref().map(|s| !s.empty()).unwrap_or(false)
+    }
+
+    fn stop_playback(&mut self) {
+        if let Some(sink) = self.audio_sink.take() {
+            sink.stop();
+        }
+        // Drop stream last
+        let _ = self.audio_stream.take();
+        // Attempt to remove temp file if any
+        if let Some(p) = self.temp_audio_path.take() {
+            let _ = std::fs::remove_file(p);
+        }
+        self.eq_visible = false;
+        self.status_msg = "Playback stopped".into();
     }
 }
 
@@ -129,7 +187,9 @@ async fn main() -> Result<()> {
     // Clear once so the first draw is visible even if previous output existed
     let _ = terminal.clear();
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<AppState>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<AppUpdate>();
+    // UI message channel for async helpers like playback
+    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiMsg>();
     let mut app = AppState::new();
 
     // Spawn background task to periodically fetch
@@ -138,14 +198,14 @@ async fn main() -> Result<()> {
         let mut ticker = interval(Duration::from_secs(60));
         // First immediate fetch without waiting 60s
         if let Err(e) = fetch_and_send(tx_clone.clone()).await {
-            let mut st = AppState::new();
+            let mut st = AppUpdate::new();
             st.status_msg = format!("Initial fetch failed: {}", e);
             let _ = tx_clone.send(st);
         }
         loop {
             ticker.tick().await;
             if let Err(e) = fetch_and_send(tx_clone.clone()).await {
-                let mut st = AppState::new();
+                let mut st = AppUpdate::new();
                 st.status_msg = format!("Fetch failed: {}", e);
                 let _ = tx_clone.send(st);
             }
@@ -163,7 +223,7 @@ async fn main() -> Result<()> {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(1),        // list
-                Constraint::Length(3),     // status (taller)
+                Constraint::Length(4),     // status (2 inner lines; +2 borders)
             ])
             .split(term_rect);
         // Account for list block borders (top+bottom) when computing visible rows.
@@ -172,12 +232,20 @@ async fn main() -> Result<()> {
         let viewport_rows_lines: usize = chunks[0].height.saturating_sub(2) as usize;
         let viewport_items: usize = (viewport_rows_lines / 2).max(1);
 
-        // Apply incoming state updates
+        // Apply incoming state updates (data fetch)
         while let Ok(new_state) = rx.try_recv() {
             // Merge: replace data and status, keep scroll if possible
             let scroll = app.scroll;
             let selected = app.selected;
-            app = new_state;
+            // Preserve audio state across data updates
+            let audio_stream = app.audio_stream.take();
+            let audio_sink = app.audio_sink.take();
+            let temp_audio_path = app.temp_audio_path.take();
+            // Apply incoming update
+            app.feeds = new_state.feeds;
+            app.last_updated = new_state.last_updated;
+            app.source = new_state.source;
+            app.status_msg = new_state.status_msg;
             // Clamp preserved scroll so the last item remains visible when list shrinks.
             let max_scroll = app
                 .feeds
@@ -189,6 +257,68 @@ async fn main() -> Result<()> {
                 app.selected = 0;
             } else {
                 app.selected = selected.min(app.feeds.len() - 1);
+            }
+            // Restore audio state
+            app.audio_stream = audio_stream;
+            app.audio_sink = audio_sink;
+            app.temp_audio_path = temp_audio_path;
+        }
+
+        // Handle UI messages like playback
+        while let Ok(msg) = ui_rx.try_recv() {
+            match msg {
+                UiMsg::Status(s) => {
+                    app.status_msg = s;
+                }
+                UiMsg::XmlReady(xml) => {
+                    app.xml_text = xml;
+                    app.xml_show = true;
+                    app.xml_scroll = 0;
+                    app.status_msg = "XML loaded".into();
+                }
+                UiMsg::XmlError(e) => {
+                    app.status_msg = format!("XML error: {}", e);
+                    app.xml_show = false;
+                    app.xml_scroll = 0;
+                }
+                UiMsg::PlayReady(path) => {
+                    match start_playback_from_file(&path) {
+                        Ok((stream, sink)) => {
+                            app.temp_audio_path = Some(path);
+                            app.audio_stream = Some(stream);
+                            app.audio_sink = Some(sink);
+                            app.status_msg = "Playing… Press Esc to stop".into();
+                            // Start EQ analyzer in background
+                            if let Some(p) = app.temp_audio_path.clone() {
+                                let ui_tx3 = ui_tx.clone();
+                                tokio::spawn(async move {
+                                    let _ = spawn_eq_analyzer(p, ui_tx3).await;
+                                });
+                            }
+                            app.eq_visible = true;
+                        }
+                        Err(e) => {
+                            app.status_msg = format!("Failed to start playback: {}", e);
+                            // cleanup file
+                            let _ = std::fs::remove_file(path);
+                        }
+                    }
+                }
+                UiMsg::PlayError(e) => {
+                    app.status_msg = format!("Playback error: {}", e);
+                }
+                UiMsg::EqUpdate(bands) => {
+                    // Simple smoothing to avoid flicker
+                    for i in 0..12 {
+                        let old = app.eq_levels[i];
+                        app.eq_levels[i] = old * 0.6 + bands[i] * 0.4;
+                    }
+                    app.eq_visible = true;
+                }
+                UiMsg::EqEnd => {
+                    app.eq_visible = false;
+                    app.eq_levels = [0.0; 12];
+                }
             }
         }
 
@@ -206,10 +336,10 @@ async fn main() -> Result<()> {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Min(1), // list
-                    Constraint::Length(3), // status (taller)
-                ])
-                .split(size);
+                        Constraint::Min(1), // list
+                        Constraint::Length(4), // status (2 inner lines; +2 borders)
+                    ])
+                    .split(size);
 
             
             // Render scrolling by using a viewport via Paragraph/List with offset isn't native; we can slice
@@ -275,7 +405,7 @@ async fn main() -> Result<()> {
             };
             let status_text = vec![
                 Line::from(vec![
-                    Span::raw("q: quit  r: refresh  ↑/↓: select  Enter: open  Esc: close  PgUp/PgDn/Home/End: nav  "),
+                    Span::raw("q: quit  r: refresh  p: play latest  x: view XML  Esc: stop/close  ↑/↓: select  Enter: open  PgUp/PgDn/Home/End: nav  "),
                     Span::styled(
                         format!("Updated: {}  Source: {}  ", updated, src),
                         Style::default().fg(Color::Yellow),
@@ -287,7 +417,8 @@ async fn main() -> Result<()> {
                 .block(
                     Block::default().borders(Borders::ALL)
                         .title("Status")
-                );
+                )
+                .wrap(Wrap { trim: true });
             f.render_widget(status, chunks[1]);
 
             // If popup requested, draw it centered over everything
@@ -302,15 +433,83 @@ async fn main() -> Result<()> {
                         Line::from(""),
                         Line::from(desc),
                         Line::from(""),
-                        Line::from(Span::styled("Press Esc to close", Style::default().fg(Color::DarkGray))),
+                        Line::from(Span::styled(
+                            "Esc: close  ↑/↓ PgUp/PgDn Home/End: scroll",
+                            Style::default().fg(Color::DarkGray),
+                        )),
                     ];
                     let popup = Paragraph::new(popup_text)
-                        .block(Block::default().title("Feed Details").borders(Borders::ALL))
-                        .wrap(Wrap { trim: true });
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .border_style(Style::default().fg(Color::Yellow))
+                                .title(Span::styled("Feed Details", Style::default().fg(Color::Yellow)))
+                        )
+                        .wrap(Wrap { trim: true })
+                        .scroll((app.popup_scroll, 0));
                     // Clear the area first so the popup is readable
                     f.render_widget(Clear, area);
                     f.render_widget(popup, area);
                 }
+            }
+
+            // XML modal viewer
+            if app.xml_show {
+                let area = centered_rect(80, 70, size);
+                let title = "Feed XML";
+                let mut lines: Vec<Line> = Vec::new();
+                // Show up to some reasonable number of lines; Paragraph will clip nonetheless
+                for l in app.xml_text.lines() {
+                    lines.push(Line::from(l.to_string()));
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "Esc: close  ↑/↓ PgUp/PgDn Home/End: scroll",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                let popup = Paragraph::new(lines)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Yellow))
+                            .title(Span::styled(title, Style::default().fg(Color::Yellow)))
+                    )
+                    .wrap(Wrap { trim: false })
+                    .scroll((app.xml_scroll, 0));
+                f.render_widget(Clear, area);
+                f.render_widget(popup, area);
+            }
+
+            // Draw EQ widget in bottom-right corner if playing/visible
+            if app.eq_visible || app.is_playing() {
+                // For 12 bars with bar_width=2 and gap=1 → ~12*3=36 + borders => ~40-44
+                let eq_width: u16 = 44;
+                let eq_height: u16 = 10;
+                // Place it above the status bar in the list area, anchored bottom-right
+                let list_area = chunks[0];
+                let eq_x = list_area.x + list_area.width.saturating_sub(eq_width + 1);
+                let eq_y = list_area.y + list_area.height.saturating_sub(eq_height + 1);
+                let eq_area = Rect { x: eq_x, y: eq_y, width: eq_width, height: eq_height };
+
+                // Build 12-band labels and values (normalized 0..100)
+                let band_names: [&str; 12] = [
+                    "B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B9", "B10", "B11", "B12",
+                ];
+                let mut data: Vec<(&str, u64)> = Vec::with_capacity(12);
+                for i in 0..12 {
+                    let v = (app.eq_levels[i].clamp(0.0, 1.0) * 100.0) as u64;
+                    data.push((band_names[i], v));
+                }
+                let barchart = BarChart::default()
+                    .block(Block::default().borders(Borders::ALL).title("EQ"))
+                    .bar_width(2)
+                    .bar_gap(1)
+                    .data(data.as_slice())
+                    .max(100)
+                    .value_style(Style::default().fg(Color::Green));
+                // Clear area so it overlays cleanly
+                f.render_widget(Clear, eq_area);
+                f.render_widget(barchart, eq_area);
             }
         })?;
 
@@ -321,10 +520,14 @@ async fn main() -> Result<()> {
                     match k.code {
                         KeyCode::Char('q') => break,
                         KeyCode::Esc => {
-                            if app.show_popup {
+                            if app.xml_show {
+                                app.xml_show = false;
+                                app.xml_scroll = 0;
+                            } else if app.show_popup {
                                 app.show_popup = false;
-                            } else {
-                                break;
+                                app.popup_scroll = 0;
+                            } else if app.is_playing() || app.audio_sink.is_some() {
+                                app.stop_playback();
                             }
                         }
                         KeyCode::Char('r') => {
@@ -335,12 +538,85 @@ async fn main() -> Result<()> {
                                 let _ = fetch_and_send(tx2).await;
                             });
                         }
+                        KeyCode::Char('p') => {
+                            if let Some(feed) = app.feeds.get(app.selected) {
+                                if let Some(feed_url) = feed.url.clone() {
+                                    app.status_msg = "Fetching feed…".into();
+                                    let ui_tx2 = ui_tx.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(e) = fetch_play_latest(feed_url, ui_tx2).await {
+                                            // best-effort status on error
+                                        }
+                                    });
+                                } else {
+                                    app.status_msg = "Selected feed has no URL".into();
+                                }
+                            }
+                        }
+                        KeyCode::Char('x') => {
+                            if let Some(feed) = app.feeds.get(app.selected) {
+                                if let Some(feed_url) = feed.url.clone() {
+                                    app.status_msg = "Downloading feed XML…".into();
+                                    let ui_tx2 = ui_tx.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(e) = fetch_feed_xml(feed_url, ui_tx2).await {
+                                            // Send error to UI channel if possible
+                                        }
+                                    });
+                                } else {
+                                    app.status_msg = "Selected feed has no URL".into();
+                                }
+                            }
+                        }
                         KeyCode::Enter => {
                             if !app.feeds.is_empty() {
                                 app.show_popup = true;
+                                app.popup_scroll = 0;
                             }
                         }
                         KeyCode::Up => {
+                            // If a modal is open, scroll it instead of moving list selection
+                            if app.xml_show || app.show_popup {
+                                // Determine which modal and its area/visible rows
+                                let modal_area = if app.xml_show {
+                                    centered_rect(80, 70, term_rect)
+                                } else {
+                                    centered_rect(70, 60, term_rect)
+                                };
+                                let visible_rows: usize = modal_area.height.saturating_sub(2) as usize;
+                                if app.xml_show {
+                                    let max_scroll = {
+                                        let total_lines = app.xml_text.lines().count() + 2; // blank + hint
+                                        total_lines.saturating_sub(visible_rows) as u16
+                                    };
+                                    if app.xml_scroll > 0 {
+                                        app.xml_scroll -= 1;
+                                    }
+                                    if app.xml_scroll > max_scroll {
+                                        app.xml_scroll = max_scroll;
+                                    }
+                                } else {
+                                    let feed_opt = app.feeds.get(app.selected);
+                                    let total_lines: usize = if let Some(feed) = feed_opt {
+                                        let title = feed.title.clone().unwrap_or_else(|| "<untitled>".into());
+                                        let desc = feed.description.clone().unwrap_or_else(|| "<no description>".into());
+                                        // title + blank + desc + blank + hint
+                                        let mut n: usize = 4; // two blanks + title + hint
+                                        n += 1; // desc line (approx; wrapping not counted)
+                                        let _ = title; // silence unused
+                                        let _ = desc; // silence unused
+                                        n
+                                    } else { 0 };
+                                    let max_scroll = total_lines.saturating_sub(visible_rows) as u16;
+                                    if app.popup_scroll > 0 {
+                                        app.popup_scroll -= 1;
+                                    }
+                                    if app.popup_scroll > max_scroll {
+                                        app.popup_scroll = max_scroll;
+                                    }
+                                }
+                                continue;
+                            }
                             if app.selected > 0 {
                                 app.selected -= 1;
                                 // Ensure selected remains visible
@@ -350,6 +626,27 @@ async fn main() -> Result<()> {
                             }
                         }
                         KeyCode::Down => {
+                            if app.xml_show || app.show_popup {
+                                let modal_area = if app.xml_show {
+                                    centered_rect(80, 70, term_rect)
+                                } else {
+                                    centered_rect(70, 60, term_rect)
+                                };
+                                let visible_rows: usize = modal_area.height.saturating_sub(2) as usize;
+                                if app.xml_show {
+                                    let total_lines = app.xml_text.lines().count() + 2;
+                                    let max_scroll = total_lines.saturating_sub(visible_rows) as i32;
+                                    let next = (app.xml_scroll as i32 + 1).min(max_scroll.max(0));
+                                    app.xml_scroll = next as u16;
+                                } else {
+                                    // approximate line count
+                                    let total_lines: usize = 5; // title + blank + desc(approx1) + blank + hint
+                                    let max_scroll = total_lines.saturating_sub(visible_rows) as i32;
+                                    let next = (app.popup_scroll as i32 + 1).min(max_scroll.max(0));
+                                    app.popup_scroll = next as u16;
+                                }
+                                continue;
+                            }
                             if app.selected + 1 < app.feeds.len() {
                                 app.selected += 1;
                                 let bottom = app.scroll + viewport_items;
@@ -359,6 +656,23 @@ async fn main() -> Result<()> {
                             }
                         }
                         KeyCode::PageUp => {
+                            if app.xml_show || app.show_popup {
+                                let modal_area = if app.xml_show {
+                                    centered_rect(80, 70, term_rect)
+                                } else {
+                                    centered_rect(70, 60, term_rect)
+                                };
+                                let visible_rows: usize = modal_area.height.saturating_sub(2) as usize;
+                                let step = visible_rows.max(1) as i32;
+                                if app.xml_show {
+                                    let next = (app.xml_scroll as i32 - step).max(0);
+                                    app.xml_scroll = next as u16;
+                                } else {
+                                    let next = (app.popup_scroll as i32 - step).max(0);
+                                    app.popup_scroll = next as u16;
+                                }
+                                continue;
+                            }
                             let step = viewport_items.max(1);
                             if app.selected >= step {
                                 app.selected -= step;
@@ -370,6 +684,27 @@ async fn main() -> Result<()> {
                             }
                         }
                         KeyCode::PageDown => {
+                            if app.xml_show || app.show_popup {
+                                let modal_area = if app.xml_show {
+                                    centered_rect(80, 70, term_rect)
+                                } else {
+                                    centered_rect(70, 60, term_rect)
+                                };
+                                let visible_rows: usize = modal_area.height.saturating_sub(2) as usize;
+                                let step = visible_rows.max(1) as i32;
+                                if app.xml_show {
+                                    let total_lines = app.xml_text.lines().count() + 2;
+                                    let max_scroll = total_lines.saturating_sub(visible_rows) as i32;
+                                    let next = (app.xml_scroll as i32 + step).min(max_scroll.max(0));
+                                    app.xml_scroll = next as u16;
+                                } else {
+                                    let total_lines: usize = 5; // rough
+                                    let max_scroll = total_lines.saturating_sub(visible_rows) as i32;
+                                    let next = (app.popup_scroll as i32 + step).min(max_scroll.max(0));
+                                    app.popup_scroll = next as u16;
+                                }
+                                continue;
+                            }
                             let step = viewport_items.max(1);
                             if !app.feeds.is_empty() {
                                 let max_idx = app.feeds.len() - 1;
@@ -381,10 +716,32 @@ async fn main() -> Result<()> {
                             }
                         }
                         KeyCode::Home => {
+                            if app.xml_show || app.show_popup {
+                                if app.xml_show { app.xml_scroll = 0; } else { app.popup_scroll = 0; }
+                                continue;
+                            }
                             app.selected = 0;
                             app.scroll = 0;
                         }
                         KeyCode::End => {
+                            if app.xml_show || app.show_popup {
+                                let modal_area = if app.xml_show {
+                                    centered_rect(80, 70, term_rect)
+                                } else {
+                                    centered_rect(70, 60, term_rect)
+                                };
+                                let visible_rows: usize = modal_area.height.saturating_sub(2) as usize;
+                                if app.xml_show {
+                                    let total_lines = app.xml_text.lines().count() + 2;
+                                    let max_scroll = total_lines.saturating_sub(visible_rows) as i32;
+                                    app.xml_scroll = max_scroll.max(0) as u16;
+                                } else {
+                                    let total_lines: usize = 5;
+                                    let max_scroll = total_lines.saturating_sub(visible_rows) as i32;
+                                    app.popup_scroll = max_scroll.max(0) as u16;
+                                }
+                                continue;
+                            }
                             if !app.feeds.is_empty() {
                                 app.selected = app.feeds.len() - 1;
                                 let max_scroll = app
@@ -410,13 +767,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn fetch_and_send(tx: mpsc::UnboundedSender<AppState>) -> Result<()> {
+async fn fetch_and_send(tx: mpsc::UnboundedSender<AppUpdate>) -> Result<()> {
     let (feeds, source) = match fetch_from_api().await {
         Ok(feeds) => (feeds, DataSource::Api),
         Err(e) => return Err(e),
     };
 
-    let mut st = AppState::new();
+    let mut st = AppUpdate::new();
     st.feeds = feeds;
     st.last_updated = Some(Local::now());
     st.source = source;
@@ -436,4 +793,396 @@ async fn fetch_from_api() -> Result<Vec<Feed>> {
 
     let api: ApiResponse = resp.json().await?;
     Ok(api.feeds)
+}
+
+// Messages sent to UI loop for async tasks like playback
+enum UiMsg {
+    Status(String),
+    PlayReady(PathBuf),
+    PlayError(String),
+    EqUpdate([f32; 12]),
+    EqEnd,
+    XmlReady(String),
+    XmlError(String),
+}
+
+async fn fetch_feed_xml(feed_url: String, tx: mpsc::UnboundedSender<UiMsg>) -> Result<()> {
+    let client = reqwest::Client::new();
+    tx.send(UiMsg::Status("Downloading RSS…".into())).ok();
+    match client.get(&feed_url).send().await {
+        Ok(resp) => match resp.error_for_status() {
+            Ok(ok) => match ok.text().await {
+                Ok(text) => {
+                    // Optionally pretty-print? Keep raw as requested
+                    tx.send(UiMsg::XmlReady(text)).ok();
+                }
+                Err(e) => {
+                    tx.send(UiMsg::XmlError(format!("failed to read body: {}", e))).ok();
+                }
+            },
+            Err(e) => {
+                tx.send(UiMsg::XmlError(format!("HTTP error: {}", e))).ok();
+            }
+        },
+        Err(e) => {
+            tx.send(UiMsg::XmlError(format!("request failed: {}", e))).ok();
+        }
+    }
+    Ok(())
+}
+
+// Lightweight update passed from background fetch to UI thread
+#[derive(Debug, Clone)]
+struct AppUpdate {
+    feeds: Vec<Feed>,
+    last_updated: Option<DateTime<Local>>, 
+    source: DataSource,
+    status_msg: String,
+}
+
+impl AppUpdate {
+    fn new() -> Self {
+        Self {
+            feeds: Vec::new(),
+            last_updated: None,
+            source: DataSource::Empty,
+            status_msg: String::new(),
+        }
+    }
+}
+
+async fn fetch_play_latest(feed_url: String, tx: mpsc::UnboundedSender<UiMsg>) -> Result<()> {
+    let client = reqwest::Client::new();
+    tx.send(UiMsg::Status("Downloading RSS…".into())).ok();
+    let xml = client.get(&feed_url).send().await?.error_for_status()?.text().await?;
+    match extract_latest_enclosure_url(&xml) {
+        Some(enclosure_url) => {
+            tx.send(UiMsg::Status("Downloading audio…".into())).ok();
+            match download_to_temp(&enclosure_url).await {
+                Ok(path) => {
+                    tx.send(UiMsg::PlayReady(path)).ok();
+                }
+                Err(e) => {
+                    tx.send(UiMsg::PlayError(format!("download failed: {}", e))).ok();
+                }
+            }
+        }
+        None => {
+            tx.send(UiMsg::PlayError("No enclosure url found".into())).ok();
+        }
+    }
+    Ok(())
+}
+
+fn extract_latest_enclosure_url(xml: &str) -> Option<String> {
+    let mut reader = XmlReader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut in_item = false;
+    let mut saw_any_item = false;
+    // Track whether we saw an <enclosure> at all in the first <item>
+    let mut saw_enclosure_tag = false;
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(XmlEvent::Start(e)) => {
+                if e.name().as_ref() == b"item" {
+                    in_item = true;
+                    saw_any_item = true;
+                } else if in_item && e.name().as_ref() == b"enclosure" {
+                    saw_enclosure_tag = true;
+                    // Look for url attribute
+                    for attr in e.attributes().flatten() {
+                        let key = attr.key.as_ref();
+                        if key == b"url" {
+                            if let Ok(val) = attr.unescape_value() {
+                                return Some(val.to_string());
+                            } else {
+                                eprintln!(
+                                    "extract_latest_enclosure_url: found <enclosure> but failed to unescape 'url' attribute value"
+                                );
+                            }
+                        }
+                    }
+                    // If we reached here, enclosure had no 'url' attribute
+                    eprintln!(
+                        "extract_latest_enclosure_url: first <item> contains <enclosure> without a 'url' attribute"
+                    );
+                }
+            }
+            Ok(XmlEvent::End(e)) => {
+                if e.name().as_ref() == b"item" {
+                    // Finished first item without returning. Provide details.
+                    if !saw_enclosure_tag {
+                        eprintln!(
+                            "extract_latest_enclosure_url: first <item> has no <enclosure> tag"
+                        );
+                    } else {
+                        eprintln!(
+                            "extract_latest_enclosure_url: first <item>'s <enclosure> lacked a usable 'url' attribute"
+                        );
+                    }
+                    return None;
+                }
+            }
+            Ok(XmlEvent::Eof) => {
+                if !saw_any_item {
+                    eprintln!(
+                        "extract_latest_enclosure_url: no <item> element found in RSS/Atom feed"
+                    );
+                } else if in_item {
+                    eprintln!(
+                        "extract_latest_enclosure_url: reached EOF while parsing first <item> without finding an <enclosure url=…>"
+                    );
+                } else {
+                    eprintln!(
+                        "extract_latest_enclosure_url: reached EOF before locating <enclosure url=…> in first <item>"
+                    );
+                }
+                break;
+            }
+            Err(e) => {
+                eprintln!(
+                    "extract_latest_enclosure_url: XML parse error while reading feed: {}",
+                    e
+                );
+                break;
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+    None
+}
+
+async fn download_to_temp(url: &str) -> Result<PathBuf> {
+    let client = reqwest::Client::new();
+    let mut resp = client.get(url).send().await?.error_for_status()?;
+    let mut tmp = tempfile::NamedTempFile::new()?;
+    while let Some(chunk) = resp.chunk().await? {
+        use std::io::Write;
+        tmp.write_all(&chunk)?;
+    }
+    let (_file, path) = tmp.keep()?; // persist so path remains valid
+    Ok(path)
+}
+
+fn start_playback_from_file(path: &PathBuf) -> Result<(OutputStream, Sink)> {
+    // Keep OutputStream alive together with Sink
+    let (stream, handle) = OutputStream::try_default()?;
+    let sink = Sink::try_new(&handle)?;
+    let file = File::open(path)?;
+    let decoder = rodio::Decoder::new(std::io::BufReader::new(file))?;
+    sink.append(decoder);
+    sink.play();
+    Ok((stream, sink))
+}
+
+// Spawn an analyzer that computes 5-band EQ magnitudes from the audio file and sends periodic updates.
+async fn spawn_eq_analyzer(path: PathBuf, tx: mpsc::UnboundedSender<UiMsg>) -> Result<()> {
+    // Run in blocking thread since decoding is CPU-bound
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = analyze_file_eq(path, tx.clone()) {
+            let _ = tx.send(UiMsg::Status(format!("EQ analyzer error: {}", e)));
+            let _ = tx.send(UiMsg::EqEnd);
+        }
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("join error: {}", e))?;
+    Ok(())
+}
+
+fn analyze_file_eq(path: PathBuf, tx: mpsc::UnboundedSender<UiMsg>) -> Result<()> {
+    // Open media source
+    let file = std::fs::File::open(&path)?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let hint = Hint::new();
+    let probed = get_probe()
+        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+    .map_err(|e| anyhow::anyhow!("probe error: {}", e))?;
+    let mut format = probed.format;
+
+    // Select the first audio track
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.sample_rate.is_some())
+        .ok_or_else(|| anyhow::anyhow!("no audio track"))?
+        .clone();
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .map_err(|e| anyhow::anyhow!("decoder error: {}", e))?;
+
+    let sample_rate = track.codec_params.sample_rate.unwrap_or(44100) as f32;
+
+    // FFT setup
+    let nfft: usize = 2048;
+    let hop: usize = 1024; // 50% overlap
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(nfft);
+    let window: Vec<f32> = (0..nfft)
+        .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * (i as f32) / (nfft as f32)).cos())
+        .collect();
+
+    let mut frame: Vec<f32> = Vec::with_capacity(nfft * 2);
+    let mut last_send = std::time::Instant::now();
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            Err(SymphoniaError::ResetRequired) => {
+                // Handle stream reset
+                decoder.reset();
+                continue;
+            }
+            Err(SymphoniaError::IoError(_)) | Err(SymphoniaError::DecodeError(_)) => {
+                break;
+            }
+            Err(_) => break,
+        };
+
+        let decoded = match decoder.decode(&packet) {
+            Ok(buf) => buf,
+            Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(e) => return Err(anyhow::anyhow!("decode error: {}", e)),
+        };
+
+        // Convert to f32 mono samples
+        match decoded {
+            AudioBufferRef::F32(buf) => {
+                let chs = buf.spec().channels.count();
+                for f in 0..buf.frames() {
+                    let mut s = 0.0f32;
+                    for ch in 0..chs {
+                        s += buf.chan(ch)[f];
+                    }
+                    s /= chs as f32;
+                    frame.push(s);
+                }
+            }
+            AudioBufferRef::U8(buf) => {
+                let chs = buf.spec().channels.count();
+                for f in 0..buf.frames() {
+                    let mut s = 0.0f32;
+                    for ch in 0..chs {
+                        s += (buf.chan(ch)[f] as f32 - 128.0) / 128.0;
+                    }
+                    s /= chs as f32;
+                    frame.push(s);
+                }
+            }
+            AudioBufferRef::S16(buf) => {
+                let chs = buf.spec().channels.count();
+                for f in 0..buf.frames() {
+                    let mut s = 0.0f32;
+                    for ch in 0..chs {
+                        s += buf.chan(ch)[f] as f32 / 32768.0;
+                    }
+                    s /= chs as f32;
+                    frame.push(s);
+                }
+            }
+            AudioBufferRef::S24(buf) => {
+                let chs = buf.spec().channels.count();
+                for f in 0..buf.frames() {
+                    let mut s = 0.0f32;
+                    for ch in 0..chs {
+                        let v = buf.chan(ch)[f].into_i32() as f32 / 8_388_608.0; // 2^23
+                        s += v;
+                    }
+                    s /= chs as f32;
+                    frame.push(s);
+                }
+            }
+            AudioBufferRef::S32(buf) => {
+                let chs = buf.spec().channels.count();
+                for f in 0..buf.frames() {
+                    let mut s = 0.0f32;
+                    for ch in 0..chs {
+                        s += buf.chan(ch)[f] as f32 / 2_147_483_648.0; // 2^31
+                    }
+                    s /= chs as f32;
+                    frame.push(s);
+                }
+            }
+            AudioBufferRef::F64(buf) => {
+                let chs = buf.spec().channels.count();
+                for f in 0..buf.frames() {
+                    let mut s = 0.0f32;
+                    for ch in 0..chs {
+                        s += buf.chan(ch)[f] as f32;
+                    }
+                    s /= chs as f32;
+                    frame.push(s);
+                }
+            }
+            _ => {}
+        }
+
+        while frame.len() >= nfft {
+            // Build FFT input with windowing over the first nfft samples
+            let mut input: Vec<Complex32> = (0..nfft)
+                .map(|i| Complex32::new(frame[i] * window[i], 0.0))
+                .collect();
+
+            // Execute FFT
+            fft.process(&mut input);
+
+            // Magnitude spectrum for positive frequencies
+            let half = nfft / 2;
+            let mags: Vec<f32> = input.into_iter().take(half).map(|c| c.norm()).collect();
+
+            // Frequency band edges (Hz) for 12 bands, log-spaced from ~20 Hz to Nyquist (capped at 20 kHz)
+            let nyquist = sample_rate / 2.0;
+            let high_cap = nyquist.min(20_000.0).max(200.0); // ensure sensible upper bound >= 200 Hz
+            let low_cap = 20.0_f32.min(high_cap / 32.0); // if Nyquist is tiny, push low down proportionally
+            let mut edges: [f32; 13] = [0.0; 13];
+            // Create 13 edges for 12 bands, geometrically spaced
+            let ratio = if high_cap > low_cap {
+                (high_cap / low_cap).powf(1.0 / 12.0)
+            } else {
+                1.0
+            };
+            edges[0] = 0.0; // include DC in first band
+            let mut f = low_cap;
+            for i in 1..13 {
+                edges[i] = f.min(high_cap);
+                f *= ratio;
+            }
+
+            // Sum bins into 12 bands
+            let bin_hz = sample_rate / nfft as f32;
+            let mut bands = [0.0f32; 12];
+            for (bi, mag) in mags.iter().enumerate() {
+                let freq = bi as f32 * bin_hz;
+                for b in 0..12 {
+                    if freq >= edges[b] && freq < edges[b + 1] {
+                        bands[b] += *mag;
+                        break;
+                    }
+                }
+            }
+
+            // Log scale and normalize each band approximately to 0..1
+            for b in 0..12 {
+                let v = (bands[b] + 1e-6).log10();
+                // Rough normalization: map approximately [-6..2] -> [0..1]
+                let norm = ((v + 6.0) / 8.0).clamp(0.0, 1.0);
+                bands[b] = norm;
+            }
+
+            // Throttle updates to ~8 Hz
+            if last_send.elapsed() >= std::time::Duration::from_millis(120) {
+                let _ = tx.send(UiMsg::EqUpdate(bands));
+                last_send = std::time::Instant::now();
+            }
+
+            // Advance by hop size
+            let drain = hop.min(frame.len());
+            frame.drain(0..drain);
+        }
+    }
+
+    let _ = tx.send(UiMsg::EqEnd);
+    Ok(())
 }
