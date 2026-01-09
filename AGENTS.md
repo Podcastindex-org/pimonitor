@@ -4,7 +4,10 @@
 ##: Unit testing
 - When new functions are created, write a unit test for them.
 - Run `cargo test`.  If any tests fail, fix them and rebuild.
+- All tests should be created in the `tests` directory.
 
+##: AI/LLM coding
+- When AI/LLM coding agents make changes, write a new datestamped file to the `.llm_history` directory outlining the changes made.
 
 ##: The pimonitor.yaml configuration file
 - This is a YAML configuration file.
