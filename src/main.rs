@@ -33,6 +33,7 @@ use tokio::sync::mpsc;
 use tokio::time::interval;
 use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use sha1::{Sha1, Digest};
 
 // Global configuration flags populated from pimonitor.yaml
 // Default polling interval is 60 seconds
@@ -750,6 +751,29 @@ async fn main() -> Result<()> {
                                 }
                             }
                         }
+                        KeyCode::Char('d') => {
+                            // Mark selected feed as problematic via Podcast Index API
+                            if !PI_READ_WRITE.load(Ordering::Relaxed) {
+                                app.status_msg = "Read/write disabled: missing API credentials".into();
+                            } else if let Some(feed) = app.feeds.get(app.selected) {
+                                if let Some(feed_id) = feed.id {
+                                    app.status_msg = format!("Reporting feed {} as problematic…", feed_id);
+                                    let ui_tx2 = ui_tx.clone();
+                                    tokio::spawn(async move {
+                                        match pi_report_problematic(feed_id).await {
+                                            Ok(desc) => {
+                                                let _ = ui_tx2.send(UiMsg::Status(format!("Problematic reported: {}", desc)));
+                                            }
+                                            Err(e) => {
+                                                let _ = ui_tx2.send(UiMsg::Status(format!("Report failed: {}", e)));
+                                            }
+                                        }
+                                    });
+                                } else {
+                                    app.status_msg = "Selected feed has no id".into();
+                                }
+                            }
+                        }
                         KeyCode::Enter => {
                             if !app.feeds.is_empty() {
                                 app.show_popup = true;
@@ -984,6 +1008,79 @@ async fn pi_get_recent_newfeeds() -> Result<Vec<Feed>> {
 
     let api: ApiResponse = resp.json().await?;
     Ok(api.feeds)
+}
+
+// Load API credentials from pimonitor.yaml on demand.
+// Returns Some((key, secret)) if both are present and non-empty, otherwise None.
+fn load_pi_creds_from(path: &Path) -> Option<(String, String)> {
+    if let Ok(file) = File::open(path) {
+        if let Ok(cfg) = serde_yaml::from_reader::<_, AppConfig>(file) {
+            let key_ok = cfg
+                .pi_api_key
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            let sec_ok = cfg
+                .pi_api_secret
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if key_ok && sec_ok {
+                return Some((
+                    cfg.pi_api_key.unwrap(),
+                    cfg.pi_api_secret.unwrap(),
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn load_pi_creds() -> Option<(String, String)> {
+    let path = PathBuf::from("pimonitor.yaml");
+    load_pi_creds_from(&path)
+}
+
+// Build PodcastIndex authentication headers.
+// Returns (x_auth_key, x_auth_date, authorization)
+fn build_pi_auth_headers(key: &str, secret: &str, now_unix: i64) -> (String, String, String) {
+    let date_str = now_unix.to_string();
+    let mut hasher = Sha1::new();
+    hasher.update(key.as_bytes());
+    hasher.update(secret.as_bytes());
+    hasher.update(date_str.as_bytes());
+    let digest = hasher.finalize();
+    let auth = format!("{:x}", digest);
+    (key.to_string(), date_str, auth)
+}
+
+// Report a feed as problematic to Podcast Index.
+// Uses POST https://api.podcastindex.org/api/1.0/report/problematic?id=<feed_id>
+async fn pi_report_problematic(feed_id: u64) -> Result<String> {
+    let (key, secret) = load_pi_creds()
+        .ok_or_else(|| anyhow::anyhow!("API credentials missing in pimonitor.yaml"))?;
+
+    let now = chrono::Utc::now().timestamp();
+    let (x_key, x_date, auth) = build_pi_auth_headers(&key, &secret, now);
+    let client = reqwest::Client::new();
+    let resp = client
+        .post("https://api.podcastindex.org/api/1.0/report/problematic")
+        .query(&[("id", feed_id)])
+        .header("User-Agent", "pimonitor/0.1")
+        .header("X-Auth-Key", x_key)
+        .header("X-Auth-Date", x_date)
+        .header("Authorization", auth)
+        .send()
+        .await?
+        .error_for_status()?;
+
+    // This endpoint returns { status, description, ... }
+    let v: serde_json::Value = resp.json().await.unwrap_or(serde_json::json!({}));
+    let desc = v
+        .get("description")
+        .and_then(|d| d.as_str())
+        .unwrap_or("Reported");
+    Ok(desc.to_string())
 }
 
 // Messages sent to UI loop for async tasks like playback

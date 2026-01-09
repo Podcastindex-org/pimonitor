@@ -5,6 +5,13 @@
 - When polling the podcast index for new/recent feeds, send the `since` url parameter which should contain a unix timestamp of the current time minus 86,400 seconds (24 hours).
 - When polling the podcast index for new/recent feeds, send the `max` url parameter with a value of 500.
 
+## Marking a feed as "problematic"
+- Pressing the `d` key will mark a feed as problematic by sending a POST request to 
+  the Podcast Index API endpoint: 'https://api.podcastindex.org/api/1.0/report/problematic'.  
+  The call to the '/report/problematic' endpoint should contain the feed ID as a url 
+  parameter called `id`.  This endpoint requires an API key and secret from 
+  the `pimonitor.yaml` configuration file.
+
 ## Unit testing
 - When new functions are created, write a unit test for them.
 - Run `cargo test`.  If any tests fail, fix them and rebuild.
