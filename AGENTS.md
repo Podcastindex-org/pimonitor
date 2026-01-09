@@ -4,6 +4,7 @@
 ## Polling for new/recent feeds
 - When polling the podcast index for new/recent feeds, send the `since` url parameter which should contain a unix timestamp of the current time minus 86,400 seconds (24 hours).
 - When polling the podcast index for new/recent feeds, send the `max` url parameter with a value of 500.
+- Each feed object in the api response `feeds` array/vector contains a `dead` property.  If this property is `true` or `1`, hide the feed from the user interface.
 
 ## Marking a feed as "problematic"
 - Pressing the `d` key will mark a feed as problematic by sending a POST request to 
@@ -11,6 +12,8 @@
   The call to the '/report/problematic' endpoint should contain the feed ID as a url 
   parameter called `id`.  This endpoint requires an API key and secret from 
   the `pimonitor.yaml` configuration file.
+- If the call to the '/report/problematic' endpoint fails, print an error message to the console.
+- If the call to the '/report/problematic' endpoint succeeds, refresh the feed list by polling the new/recent feeds endpoint again.
 
 ## Unit testing
 - When new functions are created, write a unit test for them.

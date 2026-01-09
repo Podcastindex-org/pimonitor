@@ -232,6 +232,10 @@ struct Feed {
     #[serde(rename = "itunesId")]
     itunes_id: Option<u64>,
     source: Option<u32>,
+    // The Podcast Index API includes a `dead` field indicating dead feeds.
+    // It may be returned as a boolean or an integer (1/0). Use Value to be flexible.
+    #[serde(default)]
+    dead: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -759,10 +763,13 @@ async fn main() -> Result<()> {
                                 if let Some(feed_id) = feed.id {
                                     app.status_msg = format!("Reporting feed {} as problematic…", feed_id);
                                     let ui_tx2 = ui_tx.clone();
+                                    let tx2 = tx.clone();
                                     tokio::spawn(async move {
                                         match pi_report_problematic(feed_id).await {
                                             Ok(desc) => {
                                                 let _ = ui_tx2.send(UiMsg::Status(format!("Problematic reported: {}", desc)));
+                                                // On success, refresh the feed list by polling again.
+                                                let _ = poll_for_new_feeds(tx2).await;
                                             }
                                             Err(e) => {
                                                 let _ = ui_tx2.send(UiMsg::Status(format!("Report failed: {}", e)));
@@ -1007,7 +1014,28 @@ async fn pi_get_recent_newfeeds() -> Result<Vec<Feed>> {
         .error_for_status()?;
 
     let api: ApiResponse = resp.json().await?;
-    Ok(api.feeds)
+    // Filter out feeds marked as dead per AGENTS.md requirement.
+    let feeds: Vec<Feed> = api
+        .feeds
+        .into_iter()
+        .filter(|f| {
+            match &f.dead {
+                None => true,
+                Some(v) => match v {
+                    Value::Bool(b) => !*b,
+                    Value::Number(n) => n.as_i64().map(|i| i == 0).unwrap_or(true),
+                    Value::String(s) => {
+                        let s = s.to_lowercase();
+                        !(s == "1" || s == "true")
+                    }
+                    _ => true,
+                },
+            }
+        })
+        .collect();
+
+    // Keep a stable ordering (as provided) and return
+    Ok(feeds)
 }
 
 // Load API credentials from pimonitor.yaml on demand.
@@ -1045,10 +1073,11 @@ fn load_pi_creds() -> Option<(String, String)> {
 // Returns (x_auth_key, x_auth_date, authorization)
 fn build_pi_auth_headers(key: &str, secret: &str, now_unix: i64) -> (String, String, String) {
     let date_str = now_unix.to_string();
+    // Per Podcast Index docs and tests, the Authorization header is
+    // sha1( key + secret + X-Auth-Date )
+    let payload = format!("{}{}{}", key, secret, date_str);
     let mut hasher = Sha1::new();
-    hasher.update(key.as_bytes());
-    hasher.update(secret.as_bytes());
-    hasher.update(date_str.as_bytes());
+    hasher.update(payload.as_bytes());
     let digest = hasher.finalize();
     let auth = format!("{:x}", digest);
     (key.to_string(), date_str, auth)
