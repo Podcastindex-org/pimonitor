@@ -1,6 +1,6 @@
 use std::io::IsTerminal as _; // for stdout().is_terminal()
 use std::time::Duration;
-use std::{fs::File, path::PathBuf};
+use std::{fs::File, path::{Path, PathBuf}};
 use std::io::{Cursor, Read};
 
 use anyhow::Result;
@@ -103,9 +103,30 @@ fn read_yaml_config() {
     PI_READ_WRITE.store(can_rw, Ordering::Relaxed);
 }
 
+/// Ensure a default `pimonitor.yaml` exists on disk with blank values.
+/// This creates a minimal YAML file containing empty credentials and no poll_interval,
+/// only when the file does not already exist.
+fn ensure_config_exists_at(path: &Path) -> Result<()> {
+    if !path.exists() {
+        // Create with blank values for keys. poll_interval is optional and omitted by default.
+        let default_yaml = concat!(
+            "pi_api_key: \"\"\n",
+            "pi_api_secret: \"\"\n",
+        );
+        std::fs::write(path, default_yaml)?;
+    }
+    Ok(())
+}
+
+fn ensure_config_exists() -> Result<()> {
+    ensure_config_exists_at(Path::new("pimonitor.yaml"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::io::Write;
 
     fn mk_cfg(key: Option<&str>, secret: Option<&str>, poll: Option<u64>) -> AppConfig {
         AppConfig {
@@ -144,6 +165,34 @@ mod tests {
         let cfg = mk_cfg(None, None, Some(31));
         let (secs, _rw) = evaluate_config(&cfg);
         assert_eq!(secs, 31);
+    }
+
+    #[test]
+    fn ensure_config_creates_when_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("pimonitor.yaml");
+        assert!(!p.exists());
+        ensure_config_exists_at(&p).expect("create config");
+        assert!(p.exists());
+        let contents = fs::read_to_string(&p).expect("read config");
+        // Should contain blank key and secret lines, poll_interval omitted
+        assert!(contents.contains("pi_api_key: \"\""));
+        assert!(contents.contains("pi_api_secret: \"\""));
+        assert!(!contents.contains("poll_interval"));
+    }
+
+    #[test]
+    fn ensure_config_does_not_overwrite_existing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("pimonitor.yaml");
+        // Pre-create with custom content
+        let mut f = File::create(&p).expect("create file");
+        write!(f, "pi_api_key: \"abc\"\npi_api_secret: \"def\"\npoll_interval: 45\n").unwrap();
+        drop(f);
+        let before = fs::read_to_string(&p).unwrap();
+        ensure_config_exists_at(&p).expect("no overwrite");
+        let after = fs::read_to_string(&p).unwrap();
+        assert_eq!(before, after);
     }
 }
 
@@ -293,6 +342,9 @@ async fn main() -> Result<()> {
         );
         return Ok(());
     }
+
+    // Create default config file on startup if missing
+    let _ = ensure_config_exists();
 
     // Setup terminal UI
     enable_raw_mode()?;
