@@ -73,12 +73,23 @@ All vim keybindings work correctly in modal contexts:
 
 Run the application with vim keybindings:
 ```bash
-`cargo run -- --vim`
+cargo run -- --vim
+# or with nix:
+nix run .#vim
 ```
 
 Run the application with standard keybindings:
 ```bash
 cargo run
+# or with nix:
+nix run
+```
+
+Build the application:
+```bash
+cargo build
+# or with nix:
+nix build
 ```
 
 ## Testing Recommendations

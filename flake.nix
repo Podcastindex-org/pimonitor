@@ -99,9 +99,9 @@
           
           vim = {
             type = "app";
-            program = pkgs.writeShellScript "pimonitor-vim" ''
+            program = "${pkgs.writeShellScript "pimonitor-vim" ''
               ${self.packages.${system}.default}/bin/pimonitor --vim
-            '';
+            ''}";
           };
         };
       }
