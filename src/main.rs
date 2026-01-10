@@ -509,7 +509,6 @@ async fn main() -> Result<()> {
                             app.audio_stream = Some(stream);
                             app.audio_sink = Some(sink);
                             app.playback_start = Some(std::time::Instant::now());
-                            app.status_msg = "Playing… Press Esc to stop".into();
                             // Start EQ analyzer in background
                             if let Some(p) = app.temp_audio_path.clone() {
                                 let ui_tx3 = ui_tx.clone();
@@ -538,8 +537,11 @@ async fn main() -> Result<()> {
                     app.eq_visible = true;
                 }
                 UiMsg::EqEnd => {
-                    app.eq_visible = false;
-                    app.eq_levels = [0.0; 12];
+                    // Only hide EQ if playback has stopped
+                    if app.audio_sink.is_none() {
+                        app.eq_visible = false;
+                        app.eq_levels = [0.0; 12];
+                    }
                 }
             }
         }
@@ -1819,9 +1821,16 @@ fn start_playback_from_file(path: &PathBuf) -> Result<(OutputStream, Sink)> {
     let cursor = Cursor::new(buf);
 
     // Catch panics from rodio/symphonia decoder initialization
+    // Set a temporary panic hook that does nothing to suppress panic messages
+    let old_hook = panic::take_hook();
+    panic::set_hook(Box::new(|_| {}));
+    
     let decoder_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         rodio::Decoder::new(cursor)
     }));
+    
+    // Restore the original panic hook
+    panic::set_hook(old_hook);
     
     let decoder = match decoder_result {
         Ok(Ok(dec)) => dec,
@@ -1892,16 +1901,31 @@ fn analyze_file_eq(path: PathBuf, tx: mpsc::UnboundedSender<UiMsg>) -> Result<()
                 decoder.reset();
                 continue;
             }
-            Err(SymphoniaError::IoError(_)) | Err(SymphoniaError::DecodeError(_)) => {
+            Err(SymphoniaError::IoError(_)) => {
+                // IO errors might be temporary, try to continue
+                continue;
+            }
+            Err(SymphoniaError::DecodeError(_)) => {
+                // Decode errors might be recoverable
+                continue;
+            }
+            Err(_) => {
+                // Other errors are likely EOF or fatal, exit the loop
                 break;
             }
-            Err(_) => break,
         };
 
         let decoded = match decoder.decode(&packet) {
             Ok(buf) => buf,
             Err(SymphoniaError::DecodeError(_)) => continue,
-            Err(e) => return Err(anyhow::anyhow!("decode error: {}", e)),
+            Err(SymphoniaError::ResetRequired) => {
+                decoder.reset();
+                continue;
+            }
+            Err(_) => {
+                // For other decode errors, try to continue
+                continue;
+            }
         };
 
         // Convert to f32 mono samples
