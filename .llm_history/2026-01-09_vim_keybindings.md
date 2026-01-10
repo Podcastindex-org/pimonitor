@@ -18,6 +18,7 @@ Added vim-style keyboard navigation to the pimonitor TUI application, enabled vi
 - Added `help_modal: bool` field to track help window visibility
 - Added `playing_feed_id: Option<u64>` field to track which feed is currently playing
 - Added `playing_feed_title: Option<String>` field to display currently playing podcast name
+- Added `volume: f32` field to track playback volume (default 1.0 = 100%)
 
 ### 3. Vim Key Bindings
 Implemented the following vim-style keybindings when `--vim` flag is enabled:
@@ -35,6 +36,8 @@ Implemented the following vim-style keybindings when `--vim` flag is enabled:
   - If the same feed is playing: pauses or resumes playback
   - If a different feed is selected: stops current playback and starts playing the newly selected feed
   - If no audio is loaded: starts playing the latest episode of the selected feed
+- **-**: Volume down (decreases by 10%, minimum 0%)
+- **=**: Volume up (increases by 10%, maximum 200%)
 - **?**: Toggle help modal (shows/hides vim keybindings reference)
 
 ### 4. Modal Scroll Support
@@ -75,6 +78,15 @@ All vim keybindings work correctly in modal contexts:
 - Prevents application crashes when encountering unsupported audio formats
 - Shows "Audio decoder panic - this audio format may not be supported" error
 - Application continues running even if playback fails
+
+### 10. Volume Control
+- Added volume control using `-` (decrease) and `=` (increase) keys
+- Volume adjusts in 10% increments
+- Range: 0% (mute) to 200% (amplified)
+- Volume changes apply immediately to playing audio
+- Status message displays current volume percentage
+- Volume state persists across feed changes
+- Help modal updated with volume control keybindings
 
 ## Usage
 
