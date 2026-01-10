@@ -1444,7 +1444,9 @@ async fn main() -> Result<()> {
     disable_raw_mode()?;
     let mut stdout = std::io::stdout();
     stdout.execute(LeaveAlternateScreen)?;
-    Ok(())
+    
+    // Exit the process to terminate the background polling task
+    std::process::exit(0);
 }
 
 // The main polling function which fetches new feeds from the Podcast Index API.
