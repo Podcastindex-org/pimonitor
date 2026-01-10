@@ -1,2 +1,7 @@
 /target
 pimonitor.yaml
+.direnv
+*~
+.vscode
+.idea
+.DS_Store

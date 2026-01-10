@@ -68,6 +68,42 @@
           # Set environment variables if needed
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
         };
+
+        # Package definition for building pimonitor
+        packages.default = pkgs.rustPlatform.buildRustPackage {
+          pname = "pimonitor";
+          version = "0.1.0";
+
+          src = ./.;
+
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+          };
+
+          inherit nativeBuildInputs buildInputs;
+
+          meta = with pkgs.lib; {
+            description = "Podcast Index monitor TUI application";
+            homepage = "https://github.com/suorcd/pimonitor";
+            license = licenses.mit;
+            maintainers = [ ];
+          };
+        };
+
+        # Apps for running pimonitor
+        apps = {
+          default = {
+            type = "app";
+            program = "${self.packages.${system}.default}/bin/pimonitor";
+          };
+          
+          vim = {
+            type = "app";
+            program = "${pkgs.writeShellScript "pimonitor-vim" ''
+              ${self.packages.${system}.default}/bin/pimonitor --vim
+            ''}";
+          };
+        };
       }
     );
 }

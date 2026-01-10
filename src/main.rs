@@ -35,6 +35,7 @@ use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use sha1::{Sha1, Digest};
 use pimonitor::{reason_options, reason_code_for_index};
+use std::collections::{HashMap, HashSet};
 
 // Global configuration flags populated from pimonitor.yaml
 // Default polling interval is 60 seconds
@@ -264,6 +265,10 @@ struct AppState {
     audio_stream: Option<OutputStream>,
     audio_sink: Option<Sink>,
     temp_audio_path: Option<PathBuf>,
+    playing_feed_id: Option<u64>,
+    playing_feed_title: Option<String>,
+    volume: f32,
+    playback_start: Option<std::time::Instant>,
     // EQ UI state
     eq_levels: [f32; 12],
     eq_visible: bool,
@@ -271,10 +276,17 @@ struct AppState {
     reason_modal: bool,
     reason_index: usize,
     pending_problem_feed_id: Option<u64>,
+    // Vim mode flag
+    vim_mode: bool,
+    // Help modal
+    help_modal: bool,
+    // App start time and ephemeral new markers
+    start_time: std::time::Instant,
+    new_feed_marks: HashMap<u64, std::time::Instant>,
 }
 
 impl AppState {
-    fn new() -> Self {
+    fn new(vim_mode: bool) -> Self {
         Self {
             feeds: Vec::new(),
             scroll: 0,
@@ -290,11 +302,19 @@ impl AppState {
             audio_stream: None,
             audio_sink: None,
             temp_audio_path: None,
+            playing_feed_id: None,
+            playing_feed_title: None,
+            volume: 1.0,
+            playback_start: None,
             eq_levels: [0.0; 12],
             eq_visible: false,
             reason_modal: false,
             reason_index: 0,
             pending_problem_feed_id: None,
+            vim_mode,
+            help_modal: false,
+            start_time: std::time::Instant::now(),
+            new_feed_marks: HashMap::new(),
         }
     }
 
@@ -316,6 +336,9 @@ impl AppState {
         if let Some(p) = self.temp_audio_path.take() {
             let _ = std::fs::remove_file(p);
         }
+        self.playing_feed_id = None;
+        self.playing_feed_title = None;
+        self.playback_start = None;
         self.eq_visible = false;
         self.status_msg = "Playback stopped".into();
     }
@@ -344,6 +367,10 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Parse command line arguments
+    let args: Vec<String> = std::env::args().collect();
+    let vim_mode = args.iter().any(|arg| arg == "--vim");
+
     // Ensure we're running in a real terminal (TTY). Many IDE "Run" consoles are not TTYs
     // and Ratatui won't be able to draw there, which looks like a blank window.
     if !std::io::stdout().is_terminal() {
@@ -371,7 +398,7 @@ async fn main() -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<AppUpdate>();
     // UI message channel for async helpers like playback
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiMsg>();
-    let mut app = AppState::new();
+    let mut app = AppState::new(vim_mode);
 
     // Spawn background task to periodically fetch
     let tx_clone = tx.clone();
@@ -433,11 +460,31 @@ async fn main() -> Result<()> {
             let audio_stream = app.audio_stream.take();
             let audio_sink = app.audio_sink.take();
             let temp_audio_path = app.temp_audio_path.take();
+            let playing_feed_id = app.playing_feed_id;
+            let playing_feed_title = app.playing_feed_title.take();
+            let playback_start = app.playback_start;
+            let volume = app.volume;
+            // Capture previously seen feed IDs
+            let mut prev_ids: HashSet<u64> = HashSet::new();
+            for f in app.feeds.iter() {
+                if let Some(id) = f.id { prev_ids.insert(id); }
+            }
             // Apply incoming update
             app.feeds = new_state.feeds;
             app.last_updated = new_state.last_updated;
             app.source = new_state.source;
             app.status_msg = new_state.status_msg;
+            // Mark newly added feeds with a temporary star if beyond first minute
+            let now = std::time::Instant::now();
+            if now.duration_since(app.start_time) >= std::time::Duration::from_secs(60) {
+                for f in app.feeds.iter() {
+                    if let Some(id) = f.id {
+                        if !prev_ids.contains(&id) {
+                            app.new_feed_marks.insert(id, now + std::time::Duration::from_secs(60));
+                        }
+                    }
+                }
+            }
             // Clamp preserved scroll so the last item remains visible when list shrinks.
             let max_scroll = app
                 .feeds
@@ -450,10 +497,14 @@ async fn main() -> Result<()> {
             } else {
                 app.selected = selected.min(app.feeds.len() - 1);
             }
-            // Restore audio state
+            // Restore audio state and playback tracking
             app.audio_stream = audio_stream;
             app.audio_sink = audio_sink;
             app.temp_audio_path = temp_audio_path;
+            app.playing_feed_id = playing_feed_id;
+            app.playing_feed_title = playing_feed_title;
+            app.playback_start = playback_start;
+            app.volume = volume;
         }
 
         // Handle UI messages like playback
@@ -479,7 +530,7 @@ async fn main() -> Result<()> {
                             app.temp_audio_path = Some(path);
                             app.audio_stream = Some(stream);
                             app.audio_sink = Some(sink);
-                            app.status_msg = "Playing… Press Esc to stop".into();
+                            app.playback_start = Some(std::time::Instant::now());
                             // Start EQ analyzer in background
                             if let Some(p) = app.temp_audio_path.clone() {
                                 let ui_tx3 = ui_tx.clone();
@@ -508,8 +559,11 @@ async fn main() -> Result<()> {
                     app.eq_visible = true;
                 }
                 UiMsg::EqEnd => {
-                    app.eq_visible = false;
-                    app.eq_levels = [0.0; 12];
+                    // Only hide EQ if playback has stopped
+                    if app.audio_sink.is_none() {
+                        app.eq_visible = false;
+                        app.eq_levels = [0.0; 12];
+                    }
                 }
             }
         }
@@ -532,6 +586,9 @@ async fn main() -> Result<()> {
                         Constraint::Length(4), // status (2 inner lines; +2 borders)
                     ])
                     .split(size);
+            // Prune expired new markers
+            let now = std::time::Instant::now();
+            app.new_feed_marks.retain(|_, exp| *exp > now);
 
             
             // Render scrolling by using a viewport via Paragraph/List with offset isn't native; we can slice
@@ -552,9 +609,16 @@ async fn main() -> Result<()> {
                         .id
                         .map(|i| i.to_string())
                         .unwrap_or_else(|| "?".into());
+                    let now = std::time::Instant::now();
+                    let is_new_mark = feed.id
+                        .and_then(|i| app.new_feed_marks.get(&i).copied())
+                        .map(|exp| exp > now)
+                        .unwrap_or(false);
 
                     // First line: [id]. [title] ([language]) - [url]
-                    let line1 = Line::from(vec![
+                    let mut parts = Vec::new();
+                    if is_new_mark { parts.push(Span::styled("*", Style::default().fg(Color::Green))); parts.push(Span::raw(" ")); }
+                    parts.extend_from_slice(&[
                         Span::styled(format!("{}.", id_str), Style::default().fg(Color::Yellow)),
                         Span::raw(" "),
                         Span::styled(title, Style::default().add_modifier(Modifier::BOLD)),
@@ -562,6 +626,7 @@ async fn main() -> Result<()> {
                         Span::raw(" - "),
                         Span::styled(url, Style::default().fg(Color::Cyan)),
                     ]);
+                    let line1 = Line::from(parts);
 
                     // Second line: link
                     let line2 = Line::from(vec![
@@ -599,14 +664,34 @@ async fn main() -> Result<()> {
             let status_text = vec![
                 // Top line: key commands and metadata
                 Line::from(vec![
-                    Span::raw("q: quit  r: refresh  p: play latest  x: view XML  d: report problematic  Esc: stop/close  ↑/↓: select  Enter: open  PgUp/PgDn/Home/End: nav  "),
+                    Span::raw(if app.vim_mode {
+                        "q: quit  ?: help  "
+                    } else {
+                        "q: quit  r: refresh  p: play latest  x: view XML  d: report problematic  Esc: stop/close  ↑/↓: select  Enter: open  PgUp/PgDn/Home/End: nav  "
+                    }),
                     Span::styled(
                         format!("Updated: {}  Source: {}", updated, src),
                         Style::default().fg(Color::Yellow),
                     ),
                 ]),
-                // Bottom line: status message only
-                Line::from(vec![Span::raw(&app.status_msg)]),
+                // Bottom line: status message and playing info
+                Line::from({
+                    let mut spans = vec![Span::raw(&app.status_msg)];
+                    // Add currently playing podcast info if available
+                    if let (Some(id), Some(title)) = (&app.playing_feed_id, &app.playing_feed_title) {
+                        spans.push(Span::raw("  | "));
+                        let elapsed = app.playback_start
+                            .map(|start| start.elapsed().as_secs())
+                            .unwrap_or(0);
+                        let minutes = elapsed / 60;
+                        let seconds = elapsed % 60;
+                        spans.push(Span::styled(
+                            format!("Playing: [{}] {} [{}:{:02}]", id, title, minutes, seconds),
+                            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                    spans
+                }),
             ];
             let status = Paragraph::new(status_text)
                 .block(
@@ -699,6 +784,54 @@ async fn main() -> Result<()> {
                     .highlight_symbol("▶ ");
                 f.render_widget(Clear, area);
                 f.render_stateful_widget(list, area, &mut list_state);
+            }
+
+            // Help modal (vim mode)
+            if app.help_modal {
+                let area = centered_rect(70, 70, size);
+                let help_text = vec![
+                    Line::from(Span::styled("Vim Mode Key Bindings", Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow))),
+                    Line::from(""),
+                    Line::from(Span::styled("Navigation:", Style::default().add_modifier(Modifier::BOLD))),
+                    Line::from("  j / k       - Move down / up"),
+                    Line::from("  h / l       - Jump to beginning / end"),
+                    Line::from("  Ctrl-n / p  - Next / previous"),
+                    Line::from("  PgUp/PgDn   - Page up / down"),
+                    Line::from("  Home/End    - Jump to start / end"),
+                    Line::from(""),
+                    Line::from(Span::styled("Actions:", Style::default().add_modifier(Modifier::BOLD))),
+                    Line::from("  Space       - Play/pause toggle"),
+                    Line::from("  -           - Volume down"),
+                    Line::from("  =           - Volume up"),
+                    Line::from("  Enter       - View feed details"),
+                    Line::from("  x           - View feed XML"),
+                    Line::from("  r           - Refresh feed list"),
+                    Line::from("  d           - Report feed as problematic"),
+                    Line::from(""),
+                    Line::from(Span::styled("Other:", Style::default().add_modifier(Modifier::BOLD))),
+                    Line::from("  q           - Quit"),
+                    Line::from("  Esc         - Close modal / stop playback"),
+                    Line::from("  ?           - Show this help"),
+                    Line::from(""),
+                    Line::from(Span::styled("Indicators:", Style::default().add_modifier(Modifier::BOLD))),
+                    Line::from("  *           - New feed marker (shows for 1 minute)"),
+                    Line::from("                Appears for feeds fetched after the first minute"),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "Press Esc or ? to close",
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                ];
+                let popup = Paragraph::new(help_text)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Yellow))
+                            .title(Span::styled("Help", Style::default().fg(Color::Yellow)))
+                    )
+                    .wrap(Wrap { trim: true });
+                f.render_widget(Clear, area);
+                f.render_widget(popup, area);
             }
 
             // Draw EQ widget in bottom-right corner only while audio is playing
@@ -823,8 +956,193 @@ async fn main() -> Result<()> {
                     }
                     match k.code {
                         KeyCode::Char('q') => break,
+                        // Vim mode ? for help
+                        KeyCode::Char('?') if app.vim_mode => {
+                            app.help_modal = !app.help_modal;
+                        }
+                        // Volume down with -
+                        KeyCode::Char('-') => {
+                            app.volume = (app.volume - 0.1).max(0.0);
+                            if let Some(sink) = &app.audio_sink {
+                                sink.set_volume(app.volume);
+                            }
+                            app.status_msg = format!("Volume: {}%", (app.volume * 100.0) as u8);
+                        }
+                        // Volume up with =
+                        KeyCode::Char('=') => {
+                            app.volume = (app.volume + 0.1).min(2.0);
+                            if let Some(sink) = &app.audio_sink {
+                                sink.set_volume(app.volume);
+                            }
+                            app.status_msg = format!("Volume: {}%", (app.volume * 100.0) as u8);
+                        }
+                        // Vim mode space for play/pause toggle
+                        KeyCode::Char(' ') if app.vim_mode => {
+                            if let Some(feed) = app.feeds.get(app.selected) {
+                                let selected_feed_id = feed.id;
+                                let selected_feed_title = feed.title.clone();
+                                let selected_feed_url = feed.url.clone();
+                                // Check if we're playing the currently selected feed
+                                let is_same_feed = app.playing_feed_id == selected_feed_id;
+                                
+                                if is_same_feed && app.audio_sink.is_some() {
+                                    // Same feed - toggle pause/resume
+                                    if let Some(sink) = &app.audio_sink {
+                                        if sink.is_paused() {
+                                            sink.play();
+                                            app.status_msg = "Playback resumed".into();
+                                        } else {
+                                            sink.pause();
+                                            app.status_msg = "Playback paused".into();
+                                        }
+                                    }
+                                } else {
+                                    // Different feed or no audio loaded - start playing the selected feed
+                                    if let Some(feed_url) = selected_feed_url {
+                                        // Stop current playback if any
+                                        if app.audio_sink.is_some() {
+                                            app.stop_playback();
+                                        }
+                                        app.playing_feed_id = selected_feed_id;
+                                        app.playing_feed_title = selected_feed_title;
+                                        app.status_msg = "Fetching feed…".into();
+                                        let ui_tx2 = ui_tx.clone();
+                                        tokio::spawn(async move {
+                                            let _ = fetch_play_latest(feed_url, ui_tx2).await;
+                                        });
+                                    } else {
+                                        app.status_msg = "Selected feed has no URL".into();
+                                    }
+                                }
+                            }
+                        }
+                        // Vim mode j for down
+                        KeyCode::Char('j') if app.vim_mode => {
+                            if app.xml_show || app.show_popup {
+                                let modal_area = if app.xml_show {
+                                    centered_rect(80, 70, term_rect)
+                                } else {
+                                    centered_rect(70, 60, term_rect)
+                                };
+                                let visible_rows: usize = modal_area.height.saturating_sub(2) as usize;
+                                if app.xml_show {
+                                    let max_scroll = {
+                                        let lines = app.xml_text.lines().count();
+                                        lines.saturating_sub(visible_rows)
+                                    };
+                                    let next = (app.xml_scroll as usize + 1).min(max_scroll);
+                                    app.xml_scroll = next as u16;
+                                } else {
+                                    let feed_opt = app.feeds.get(app.selected);
+                                    let max_scroll = if let Some(feed) = feed_opt {
+                                        let desc = feed.description.clone().unwrap_or_default();
+                                        let lines = desc.lines().count() + 5;
+                                        lines.saturating_sub(visible_rows)
+                                    } else { 0 };
+                                    let next = (app.popup_scroll as usize + 1).min(max_scroll);
+                                    app.popup_scroll = next as u16;
+                                }
+                                continue;
+                            }
+                            if app.selected + 1 < app.feeds.len() {
+                                app.selected += 1;
+                                let bottom = app.scroll + viewport_items;
+                                if app.selected >= bottom {
+                                    app.scroll = app.selected.saturating_sub(viewport_items - 1);
+                                }
+                            }
+                        }
+                        // Vim mode k for up
+                        KeyCode::Char('k') if app.vim_mode => {
+                            if app.xml_show || app.show_popup {
+                                let modal_area = if app.xml_show {
+                                    centered_rect(80, 70, term_rect)
+                                } else {
+                                    centered_rect(70, 60, term_rect)
+                                };
+                                let visible_rows: usize = modal_area.height.saturating_sub(2) as usize;
+                                if app.xml_show {
+                                    let max_scroll = {
+                                        let lines = app.xml_text.lines().count();
+                                        lines.saturating_sub(visible_rows)
+                                    };
+                                    if app.xml_scroll > 0 {
+                                        app.xml_scroll -= 1;
+                                    }
+                                    if app.xml_scroll > max_scroll as u16 {
+                                        app.xml_scroll = max_scroll as u16;
+                                    }
+                                } else {
+                                    let feed_opt = app.feeds.get(app.selected);
+                                    let max_scroll = if let Some(feed) = feed_opt {
+                                        let desc = feed.description.clone().unwrap_or_default();
+                                        let lines = desc.lines().count() + 5;
+                                        lines.saturating_sub(visible_rows)
+                                    } else { 0 };
+                                    if app.popup_scroll > 0 {
+                                        app.popup_scroll -= 1;
+                                    }
+                                    if app.popup_scroll > max_scroll as u16 {
+                                        app.popup_scroll = max_scroll as u16;
+                                    }
+                                }
+                                continue;
+                            }
+                            if app.selected > 0 {
+                                app.selected -= 1;
+                                if app.selected < app.scroll {
+                                    app.scroll = app.selected;
+                                }
+                            }
+                        }
+                        // Vim mode h for left (acts like Home)
+                        KeyCode::Char('h') if app.vim_mode => {
+                            if app.xml_show || app.show_popup {
+                                if app.xml_show { app.xml_scroll = 0; } else { app.popup_scroll = 0; }
+                                continue;
+                            }
+                            app.selected = 0;
+                            app.scroll = 0;
+                        }
+                        // Vim mode l for right (acts like End)
+                        KeyCode::Char('l') if app.vim_mode => {
+                            if app.xml_show || app.show_popup {
+                                let modal_area = if app.xml_show {
+                                    centered_rect(80, 70, term_rect)
+                                } else {
+                                    centered_rect(70, 60, term_rect)
+                                };
+                                let visible_rows: usize = modal_area.height.saturating_sub(2) as usize;
+                                if app.xml_show {
+                                    let max_scroll = {
+                                        let lines = app.xml_text.lines().count();
+                                        lines.saturating_sub(visible_rows)
+                                    };
+                                    app.xml_scroll = max_scroll.max(0) as u16;
+                                } else {
+                                    let feed_opt = app.feeds.get(app.selected);
+                                    let max_scroll = if let Some(feed) = feed_opt {
+                                        let desc = feed.description.clone().unwrap_or_default();
+                                        let lines = desc.lines().count() + 5;
+                                        lines.saturating_sub(visible_rows)
+                                    } else { 0 };
+                                    app.popup_scroll = max_scroll.max(0) as u16;
+                                }
+                                continue;
+                            }
+                            if !app.feeds.is_empty() {
+                                app.selected = app.feeds.len() - 1;
+                                let max_scroll = app
+                                    .feeds
+                                    .len()
+                                    .saturating_sub(viewport_items);
+                                app.scroll = max_scroll;
+                            }
+                        }
                         KeyCode::Esc => {
-                            if app.xml_show {
+                            if app.help_modal {
+                                app.help_modal = false;
+                            } else if app.xml_show {
                                 app.xml_show = false;
                                 app.xml_scroll = 0;
                             } else if app.show_popup {
@@ -844,6 +1162,85 @@ async fn main() -> Result<()> {
                             tokio::spawn(async move {
                                 let _ = poll_for_new_feeds(tx2).await;
                             });
+                        }
+                        // Ctrl-n for next (vim mode)
+                        KeyCode::Char('n') if app.vim_mode && k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                            if app.xml_show || app.show_popup {
+                                let modal_area = if app.xml_show {
+                                    centered_rect(80, 70, term_rect)
+                                } else {
+                                    centered_rect(70, 60, term_rect)
+                                };
+                                let visible_rows: usize = modal_area.height.saturating_sub(2) as usize;
+                                if app.xml_show {
+                                    let max_scroll = {
+                                        let lines = app.xml_text.lines().count();
+                                        lines.saturating_sub(visible_rows)
+                                    };
+                                    let next = (app.xml_scroll as usize + 1).min(max_scroll);
+                                    app.xml_scroll = next as u16;
+                                } else {
+                                    let feed_opt = app.feeds.get(app.selected);
+                                    let max_scroll = if let Some(feed) = feed_opt {
+                                        let desc = feed.description.clone().unwrap_or_default();
+                                        let lines = desc.lines().count() + 5;
+                                        lines.saturating_sub(visible_rows)
+                                    } else { 0 };
+                                    let next = (app.popup_scroll as usize + 1).min(max_scroll);
+                                    app.popup_scroll = next as u16;
+                                }
+                                continue;
+                            }
+                            if app.selected + 1 < app.feeds.len() {
+                                app.selected += 1;
+                                let bottom = app.scroll + viewport_items;
+                                if app.selected >= bottom {
+                                    app.scroll = app.selected.saturating_sub(viewport_items - 1);
+                                }
+                            }
+                        }
+                        // Ctrl-p for previous (vim mode)
+                        KeyCode::Char('p') if app.vim_mode && k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                            if app.xml_show || app.show_popup {
+                                let modal_area = if app.xml_show {
+                                    centered_rect(80, 70, term_rect)
+                                } else {
+                                    centered_rect(70, 60, term_rect)
+                                };
+                                let visible_rows: usize = modal_area.height.saturating_sub(2) as usize;
+                                if app.xml_show {
+                                    let max_scroll = {
+                                        let lines = app.xml_text.lines().count();
+                                        lines.saturating_sub(visible_rows)
+                                    };
+                                    if app.xml_scroll > 0 {
+                                        app.xml_scroll -= 1;
+                                    }
+                                    if app.xml_scroll > max_scroll as u16 {
+                                        app.xml_scroll = max_scroll as u16;
+                                    }
+                                } else {
+                                    let feed_opt = app.feeds.get(app.selected);
+                                    let max_scroll = if let Some(feed) = feed_opt {
+                                        let desc = feed.description.clone().unwrap_or_default();
+                                        let lines = desc.lines().count() + 5;
+                                        lines.saturating_sub(visible_rows)
+                                    } else { 0 };
+                                    if app.popup_scroll > 0 {
+                                        app.popup_scroll -= 1;
+                                    }
+                                    if app.popup_scroll > max_scroll as u16 {
+                                        app.popup_scroll = max_scroll as u16;
+                                    }
+                                }
+                                continue;
+                            }
+                            if app.selected > 0 {
+                                app.selected -= 1;
+                                if app.selected < app.scroll {
+                                    app.scroll = app.selected;
+                                }
+                            }
                         }
                         KeyCode::Char('p') => {
                             if let Some(feed) = app.feeds.get(app.selected) {
@@ -1086,7 +1483,9 @@ async fn main() -> Result<()> {
     disable_raw_mode()?;
     let mut stdout = std::io::stdout();
     stdout.execute(LeaveAlternateScreen)?;
-    Ok(())
+    
+    // Exit the process to terminate the background polling task
+    std::process::exit(0);
 }
 
 // The main polling function which fetches new feeds from the Podcast Index API.
@@ -1445,6 +1844,8 @@ async fn download_to_temp(url: &str) -> Result<PathBuf> {
 }
 
 fn start_playback_from_file(path: &PathBuf) -> Result<(OutputStream, Sink)> {
+    use std::panic;
+    
     // Keep OutputStream alive together with Sink
     let (stream, handle) = OutputStream::try_default()?;
     let sink = Sink::try_new(&handle)?;
@@ -1456,7 +1857,24 @@ fn start_playback_from_file(path: &PathBuf) -> Result<(OutputStream, Sink)> {
     file.read_to_end(&mut buf)?;
     let cursor = Cursor::new(buf);
 
-    let decoder = rodio::Decoder::new(cursor)?;
+    // Catch panics from rodio/symphonia decoder initialization
+    // Set a temporary panic hook that does nothing to suppress panic messages
+    let old_hook = panic::take_hook();
+    panic::set_hook(Box::new(|_| {}));
+    
+    let decoder_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        rodio::Decoder::new(cursor)
+    }));
+    
+    // Restore the original panic hook
+    panic::set_hook(old_hook);
+    
+    let decoder = match decoder_result {
+        Ok(Ok(dec)) => dec,
+        Ok(Err(e)) => return Err(anyhow::anyhow!("Decoder error: {}", e)),
+        Err(_) => return Err(anyhow::anyhow!("Audio decoder panic - this audio format may not be supported")),
+    };
+    
     sink.append(decoder);
     sink.play();
     Ok((stream, sink))
@@ -1520,16 +1938,31 @@ fn analyze_file_eq(path: PathBuf, tx: mpsc::UnboundedSender<UiMsg>) -> Result<()
                 decoder.reset();
                 continue;
             }
-            Err(SymphoniaError::IoError(_)) | Err(SymphoniaError::DecodeError(_)) => {
+            Err(SymphoniaError::IoError(_)) => {
+                // IO errors might be temporary, try to continue
+                continue;
+            }
+            Err(SymphoniaError::DecodeError(_)) => {
+                // Decode errors might be recoverable
+                continue;
+            }
+            Err(_) => {
+                // Other errors are likely EOF or fatal, exit the loop
                 break;
             }
-            Err(_) => break,
         };
 
         let decoded = match decoder.decode(&packet) {
             Ok(buf) => buf,
             Err(SymphoniaError::DecodeError(_)) => continue,
-            Err(e) => return Err(anyhow::anyhow!("decode error: {}", e)),
+            Err(SymphoniaError::ResetRequired) => {
+                decoder.reset();
+                continue;
+            }
+            Err(_) => {
+                // For other decode errors, try to continue
+                continue;
+            }
         };
 
         // Convert to f32 mono samples
