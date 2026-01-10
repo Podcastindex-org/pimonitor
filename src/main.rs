@@ -273,6 +273,8 @@ struct AppState {
     pending_problem_feed_id: Option<u64>,
     // Vim mode flag
     vim_mode: bool,
+    // Help modal
+    help_modal: bool,
 }
 
 impl AppState {
@@ -298,6 +300,7 @@ impl AppState {
             reason_index: 0,
             pending_problem_feed_id: None,
             vim_mode,
+            help_modal: false,
         }
     }
 
@@ -606,7 +609,11 @@ async fn main() -> Result<()> {
             let status_text = vec![
                 // Top line: key commands and metadata
                 Line::from(vec![
-                    Span::raw("q: quit  r: refresh  p: play latest  x: view XML  d: report problematic  Esc: stop/close  ↑/↓: select  Enter: open  PgUp/PgDn/Home/End: nav  "),
+                    Span::raw(if app.vim_mode {
+                        "q: quit  ?: help  "
+                    } else {
+                        "q: quit  r: refresh  p: play latest  x: view XML  d: report problematic  Esc: stop/close  ↑/↓: select  Enter: open  PgUp/PgDn/Home/End: nav  "
+                    }),
                     Span::styled(
                         format!("Updated: {}  Source: {}", updated, src),
                         Style::default().fg(Color::Yellow),
@@ -706,6 +713,48 @@ async fn main() -> Result<()> {
                     .highlight_symbol("▶ ");
                 f.render_widget(Clear, area);
                 f.render_stateful_widget(list, area, &mut list_state);
+            }
+
+            // Help modal (vim mode)
+            if app.help_modal {
+                let area = centered_rect(70, 70, size);
+                let help_text = vec![
+                    Line::from(Span::styled("Vim Mode Key Bindings", Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow))),
+                    Line::from(""),
+                    Line::from(Span::styled("Navigation:", Style::default().add_modifier(Modifier::BOLD))),
+                    Line::from("  j / k       - Move down / up"),
+                    Line::from("  h / l       - Jump to beginning / end"),
+                    Line::from("  Ctrl-n / p  - Next / previous"),
+                    Line::from("  PgUp/PgDn   - Page up / down"),
+                    Line::from("  Home/End    - Jump to start / end"),
+                    Line::from(""),
+                    Line::from(Span::styled("Actions:", Style::default().add_modifier(Modifier::BOLD))),
+                    Line::from("  Space       - Play/pause toggle"),
+                    Line::from("  Enter       - View feed details"),
+                    Line::from("  x           - View feed XML"),
+                    Line::from("  r           - Refresh feed list"),
+                    Line::from("  d           - Report feed as problematic"),
+                    Line::from(""),
+                    Line::from(Span::styled("Other:", Style::default().add_modifier(Modifier::BOLD))),
+                    Line::from("  q           - Quit"),
+                    Line::from("  Esc         - Close modal / stop playback"),
+                    Line::from("  ?           - Show this help"),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "Press Esc or ? to close",
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                ];
+                let popup = Paragraph::new(help_text)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Yellow))
+                            .title(Span::styled("Help", Style::default().fg(Color::Yellow)))
+                    )
+                    .wrap(Wrap { trim: true });
+                f.render_widget(Clear, area);
+                f.render_widget(popup, area);
             }
 
             // Draw EQ widget in bottom-right corner only while audio is playing
@@ -830,6 +879,10 @@ async fn main() -> Result<()> {
                     }
                     match k.code {
                         KeyCode::Char('q') => break,
+                        // Vim mode ? for help
+                        KeyCode::Char('?') if app.vim_mode => {
+                            app.help_modal = !app.help_modal;
+                        }
                         // Vim mode space for play/pause toggle
                         KeyCode::Char(' ') if app.vim_mode => {
                             // Check if audio is currently playing or paused
@@ -980,7 +1033,9 @@ async fn main() -> Result<()> {
                             }
                         }
                         KeyCode::Esc => {
-                            if app.xml_show {
+                            if app.help_modal {
+                                app.help_modal = false;
+                            } else if app.xml_show {
                                 app.xml_show = false;
                                 app.xml_scroll = 0;
                             } else if app.show_popup {
