@@ -17,6 +17,7 @@ Added vim-style keyboard navigation to the pimonitor TUI application, enabled vi
 - Modified `AppState::new()` to accept and store the vim_mode parameter
 - Added `help_modal: bool` field to track help window visibility
 - Added `playing_feed_id: Option<u64>` field to track which feed is currently playing
+- Added `playing_feed_title: Option<String>` field to display currently playing podcast name
 
 ### 3. Vim Key Bindings
 Implemented the following vim-style keybindings when `--vim` flag is enabled:
@@ -60,10 +61,13 @@ All vim keybindings work correctly in modal contexts:
 - Standard mode still shows full command list in status bar
 
 ### 8. Smart Playback Tracking
-- Application tracks which feed is currently playing via `playing_feed_id`
+- Application tracks which feed is currently playing via `playing_feed_id` and `playing_feed_title`
 - Enables intelligent play/pause behavior based on feed selection
 - Automatically stops previous feed when switching to a new one
-- `stop_playback()` properly clears the tracked feed ID
+- `stop_playback()` properly clears the tracked feed ID and title
+- Status bar displays currently playing podcast with format: "Playing: [ID] Title"
+- Playing info appears in the status bar after the status message, separated by " | "
+- Styled with green bold text for easy visibility
 
 ## Usage
 

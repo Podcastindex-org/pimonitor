@@ -265,6 +265,7 @@ struct AppState {
     audio_sink: Option<Sink>,
     temp_audio_path: Option<PathBuf>,
     playing_feed_id: Option<u64>,
+    playing_feed_title: Option<String>,
     // EQ UI state
     eq_levels: [f32; 12],
     eq_visible: bool,
@@ -296,6 +297,7 @@ impl AppState {
             audio_sink: None,
             temp_audio_path: None,
             playing_feed_id: None,
+            playing_feed_title: None,
             eq_levels: [0.0; 12],
             eq_visible: false,
             reason_modal: false,
@@ -325,6 +327,7 @@ impl AppState {
             let _ = std::fs::remove_file(p);
         }
         self.playing_feed_id = None;
+        self.playing_feed_title = None;
         self.eq_visible = false;
         self.status_msg = "Playback stopped".into();
     }
@@ -622,8 +625,19 @@ async fn main() -> Result<()> {
                         Style::default().fg(Color::Yellow),
                     ),
                 ]),
-                // Bottom line: status message only
-                Line::from(vec![Span::raw(&app.status_msg)]),
+                // Bottom line: status message and playing info
+                Line::from({
+                    let mut spans = vec![Span::raw(&app.status_msg)];
+                    // Add currently playing podcast info if available
+                    if let (Some(id), Some(title)) = (&app.playing_feed_id, &app.playing_feed_title) {
+                        spans.push(Span::raw("  | "));
+                        spans.push(Span::styled(
+                            format!("Playing: [{}] {}", id, title),
+                            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                    spans
+                }),
             ];
             let status = Paragraph::new(status_text)
                 .block(
@@ -890,6 +904,8 @@ async fn main() -> Result<()> {
                         KeyCode::Char(' ') if app.vim_mode => {
                             if let Some(feed) = app.feeds.get(app.selected) {
                                 let selected_feed_id = feed.id;
+                                let selected_feed_title = feed.title.clone();
+                                let selected_feed_url = feed.url.clone();
                                 // Check if we're playing the currently selected feed
                                 let is_same_feed = app.playing_feed_id == selected_feed_id;
                                 
@@ -906,12 +922,13 @@ async fn main() -> Result<()> {
                                     }
                                 } else {
                                     // Different feed or no audio loaded - start playing the selected feed
-                                    if let Some(feed_url) = feed.url.clone() {
+                                    if let Some(feed_url) = selected_feed_url {
                                         // Stop current playback if any
                                         if app.audio_sink.is_some() {
                                             app.stop_playback();
                                         }
                                         app.playing_feed_id = selected_feed_id;
+                                        app.playing_feed_title = selected_feed_title;
                                         app.status_msg = "Fetching feed…".into();
                                         let ui_tx2 = ui_tx.clone();
                                         tokio::spawn(async move {
