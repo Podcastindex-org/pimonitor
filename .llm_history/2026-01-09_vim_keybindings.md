@@ -68,9 +68,11 @@ All vim keybindings work correctly in modal contexts:
 - Enables intelligent play/pause behavior based on feed selection
 - Automatically stops previous feed when switching to a new one
 - `stop_playback()` properly clears the tracked feed ID and title
-- Status bar displays currently playing podcast with format: "Playing: [ID] Title"
+- Status bar displays currently playing podcast with format: "Playing: [ID] Title [MM:SS]"
+- Elapsed playback time shown in minutes:seconds format
 - Playing info appears in the status bar after the status message, separated by " | "
 - Styled with green bold text for easy visibility
+- Playback timer updates continuously while audio is playing
 
 ### 9. Panic-Safe Audio Playback
 - Wrapped rodio/symphonia decoder initialization in panic handler

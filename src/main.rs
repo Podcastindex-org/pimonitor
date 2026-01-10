@@ -267,6 +267,7 @@ struct AppState {
     playing_feed_id: Option<u64>,
     playing_feed_title: Option<String>,
     volume: f32,
+    playback_start: Option<std::time::Instant>,
     // EQ UI state
     eq_levels: [f32; 12],
     eq_visible: bool,
@@ -300,6 +301,7 @@ impl AppState {
             playing_feed_id: None,
             playing_feed_title: None,
             volume: 1.0,
+            playback_start: None,
             eq_levels: [0.0; 12],
             eq_visible: false,
             reason_modal: false,
@@ -330,6 +332,7 @@ impl AppState {
         }
         self.playing_feed_id = None;
         self.playing_feed_title = None;
+        self.playback_start = None;
         self.eq_visible = false;
         self.status_msg = "Playback stopped".into();
     }
@@ -497,6 +500,7 @@ async fn main() -> Result<()> {
                             app.temp_audio_path = Some(path);
                             app.audio_stream = Some(stream);
                             app.audio_sink = Some(sink);
+                            app.playback_start = Some(std::time::Instant::now());
                             app.status_msg = "Playing… Press Esc to stop".into();
                             // Start EQ analyzer in background
                             if let Some(p) = app.temp_audio_path.clone() {
@@ -633,8 +637,13 @@ async fn main() -> Result<()> {
                     // Add currently playing podcast info if available
                     if let (Some(id), Some(title)) = (&app.playing_feed_id, &app.playing_feed_title) {
                         spans.push(Span::raw("  | "));
+                        let elapsed = app.playback_start
+                            .map(|start| start.elapsed().as_secs())
+                            .unwrap_or(0);
+                        let minutes = elapsed / 60;
+                        let seconds = elapsed % 60;
                         spans.push(Span::styled(
-                            format!("Playing: [{}] {}", id, title),
+                            format!("Playing: [{}] {} [{}:{:02}]", id, title, minutes, seconds),
                             Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
                         ));
                     }
