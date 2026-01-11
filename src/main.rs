@@ -331,6 +331,7 @@ struct AppState {
     temp_audio_path: Option<PathBuf>,
     playing_feed_id: Option<u64>,
     playing_feed_title: Option<String>,
+    playing_duration: Option<Duration>,
     volume: f32,
     playback_start: Option<std::time::Instant>,
     // EQ UI state
@@ -368,6 +369,7 @@ impl AppState {
             temp_audio_path: None,
             playing_feed_id: None,
             playing_feed_title: None,
+            playing_duration: None,
             volume: 1.0,
             playback_start: None,
             eq_levels: [0.0; 12],
@@ -402,6 +404,7 @@ impl AppState {
         }
         self.playing_feed_id = None;
         self.playing_feed_title = None;
+        self.playing_duration = None;
         self.playback_start = None;
         self.eq_visible = false;
         self.status_msg = "Playback stopped".into();
@@ -561,6 +564,7 @@ async fn main() -> Result<()> {
             let temp_audio_path = app.temp_audio_path.take();
             let playing_feed_id = app.playing_feed_id;
             let playing_feed_title = app.playing_feed_title.take();
+            let playing_duration = app.playing_duration;
             let playback_start = app.playback_start;
             let volume = app.volume;
             // Capture previously seen feed IDs
@@ -602,6 +606,7 @@ async fn main() -> Result<()> {
             app.temp_audio_path = temp_audio_path;
             app.playing_feed_id = playing_feed_id;
             app.playing_feed_title = playing_feed_title;
+            app.playing_duration = playing_duration;
             app.playback_start = playback_start;
             app.volume = volume;
         }
@@ -626,10 +631,14 @@ async fn main() -> Result<()> {
                 UiMsg::PlayReady(path) => {
                     match start_playback_from_file(&path) {
                         Ok((stream, sink)) => {
-                            app.temp_audio_path = Some(path);
+                            app.temp_audio_path = Some(path.clone());
                             app.audio_stream = Some(stream);
                             app.audio_sink = Some(sink);
                             app.playback_start = Some(std::time::Instant::now());
+                            // Calculate duration only if vim mode (optimization/strict adherence)
+                            if app.vim_mode {
+                                app.playing_duration = get_duration_from_file(&path);
+                            }
                             // Start EQ analyzer in background
                             if let Some(p) = app.temp_audio_path.clone() {
                                 let ui_tx3 = ui_tx.clone();
@@ -784,8 +793,22 @@ async fn main() -> Result<()> {
                             .unwrap_or(0);
                         let minutes = elapsed / 60;
                         let seconds = elapsed % 60;
+                        
+                        let duration_str = if app.vim_mode {
+                            if let Some(d) = app.playing_duration {
+                                let total_secs = d.as_secs();
+                                let t_min = total_secs / 60;
+                                let t_sec = total_secs % 60;
+                                format!(" / {}:{:02}", t_min, t_sec)
+                            } else {
+                                "".to_string()
+                            }
+                        } else {
+                            "".to_string()
+                        };
+
                         spans.push(Span::styled(
-                            format!("Playing: [{}] {} [{}:{:02}]", id, title, minutes, seconds),
+                            format!("Playing: [{}] {} [{}:{:02}{}]", id, title, minutes, seconds, duration_str),
                             Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
                         ));
                     }
@@ -1981,6 +2004,31 @@ fn start_playback_from_file(path: &PathBuf) -> Result<(OutputStream, Sink)> {
     sink.append(decoder);
     sink.play();
     Ok((stream, sink))
+}
+
+fn get_duration_from_file(path: &Path) -> Option<Duration> {
+    let file = File::open(path).ok()?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let hint = Hint::new();
+    let probed = get_probe()
+        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .ok()?;
+    let format = probed.format;
+    
+    // Select the first audio track
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.sample_rate.is_some())?;
+        
+    let params = &track.codec_params;
+    
+    if let (Some(n_frames), Some(tb)) = (params.n_frames, params.time_base) {
+        let time = tb.calc_time(n_frames);
+        return Some(Duration::from_secs(time.seconds) + Duration::from_secs_f64(time.frac));
+    }
+    
+    None
 }
 
 // Spawn an analyzer that computes 5-band EQ magnitudes from the audio file and sends periodic updates.
