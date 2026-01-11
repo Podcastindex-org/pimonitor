@@ -676,6 +676,18 @@ async fn main() -> Result<()> {
             }
         }
 
+        // Check if playback has finished naturally (sink is empty)
+        // If so, stop playback to reset state and stop the timer
+        let audio_finished = if let Some(sink) = &app.audio_sink {
+            sink.empty()
+        } else {
+            false
+        };
+
+        if audio_finished && app.playing_feed_id.is_some() {
+            app.stop_playback();
+        }
+
         // Also clamp scroll on window resizes (no new state), to keep last item visible.
         let max_scroll_now = app
             .feeds
