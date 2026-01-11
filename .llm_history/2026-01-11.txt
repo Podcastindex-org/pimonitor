@@ -1,0 +1,6 @@
+Changes:
+- Preserve selected feed by feed id when new data arrives and adjust scroll so the chosen feed stays visible even if new items are inserted above it.
+- Kept new-feed markers and audio state handling intact while improving selection stability.
+
+Tests:
+- cargo test

@@ -561,6 +561,10 @@ async fn main() -> Result<()> {
             // Merge: replace data and status, keep scroll if possible
             let scroll = app.scroll;
             let selected = app.selected;
+            let prev_selected_id = app
+                .feeds
+                .get(selected)
+                .and_then(|f| f.id);
             // Preserve audio state across data updates
             let audio_stream = app.audio_stream.take();
             let audio_sink = app.audio_sink.take();
@@ -592,17 +596,37 @@ async fn main() -> Result<()> {
                 }
             }
             // Clamp preserved scroll so the last item remains visible when list shrinks.
-            let max_scroll = app
-                .feeds
-                .len()
-                .saturating_sub(viewport_items);
-            app.scroll = scroll.min(max_scroll);
-            // Clamp selected within bounds
-            if app.feeds.is_empty() {
-                app.selected = 0;
+            let len = app.feeds.len();
+            let new_selected = if let Some(id) = prev_selected_id {
+                app
+                    .feeds
+                    .iter()
+                    .position(|f| f.id == Some(id))
+                    .unwrap_or_else(|| selected.min(len.saturating_sub(1)))
+            } else if len == 0 {
+                0
             } else {
-                app.selected = selected.min(app.feeds.len() - 1);
+                selected.min(len - 1)
+            };
+
+            // Preserve scroll when possible but keep the selection visible if feeds shift.
+            let mut new_scroll = scroll;
+            let max_scroll = len.saturating_sub(viewport_items);
+            new_scroll = new_scroll.min(max_scroll);
+            if len > 0 {
+                if new_selected < new_scroll {
+                    new_scroll = new_selected;
+                }
+                let viewport_end = new_scroll + viewport_items.saturating_sub(1);
+                if new_selected > viewport_end {
+                    new_scroll = new_selected.saturating_sub(viewport_items.saturating_sub(1));
+                }
+                let max_scroll_again = len.saturating_sub(viewport_items);
+                new_scroll = new_scroll.min(max_scroll_again);
             }
+
+            app.scroll = new_scroll;
+            app.selected = new_selected;
             // Restore audio state and playback tracking
             app.audio_stream = audio_stream;
             app.audio_sink = audio_sink;
