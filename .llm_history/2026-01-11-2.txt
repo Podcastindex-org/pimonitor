@@ -1,0 +1,7 @@
+Changes:
+- Added local tracking of flagged feeds and render them with a flag label plus reason before the ID, keeping them visible.
+- Applied strike-through styling to flagged feed rows to indicate they were reported without removing them.
+- Persist flag reason immediately when reports succeed via UI message and keep all other UI behaviors intact.
+
+Tests:
+- cargo test

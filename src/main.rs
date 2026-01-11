@@ -349,6 +349,8 @@ struct AppState {
     // App start time and ephemeral new markers
     start_time: std::time::Instant,
     new_feed_marks: HashMap<u64, std::time::Instant>,
+    // Locally tracked flagged feeds and their reason codes
+    flagged_reasons: HashMap<u64, u8>,
 }
 
 impl AppState {
@@ -383,6 +385,7 @@ impl AppState {
             help_modal: false,
             start_time: std::time::Instant::now(),
             new_feed_marks: HashMap::new(),
+            flagged_reasons: HashMap::new(),
         }
     }
 
@@ -655,6 +658,9 @@ async fn main() -> Result<()> {
                     app.xml_show = false;
                     app.xml_scroll = 0;
                 }
+                UiMsg::FlagApplied(feed_id, reason_code) => {
+                    app.flagged_reasons.insert(feed_id, reason_code);
+                }
                 UiMsg::PlayReady(path) => {
                     match start_playback_from_file(&path) {
                         Ok((stream, sink)) => {
@@ -766,6 +772,20 @@ async fn main() -> Result<()> {
                     // First line: [id]. [title] ([language]) - [url]
                     let mut parts = Vec::new();
                     if is_new_mark { parts.push(Span::styled("*", Style::default().fg(Color::Green))); parts.push(Span::raw(" ")); }
+                    let flagged_reason = feed
+                        .id
+                        .and_then(|id| app.flagged_reasons.get(&id).copied());
+                    if let Some(code) = flagged_reason {
+                        let label = reason_options()
+                            .into_iter()
+                            .find(|(_, c)| *c == code)
+                            .map(|(label, _)| label)
+                            .unwrap_or("Flagged");
+                        parts.push(Span::styled(
+                            format!("[FLAG {}] ", label),
+                            Style::default().fg(Color::Red),
+                        ));
+                    }
                     parts.extend_from_slice(&[
                         Span::styled(format!("{}.", id_str), Style::default().fg(Color::Yellow)),
                         Span::raw(" "),
@@ -774,12 +794,18 @@ async fn main() -> Result<()> {
                         Span::raw(" - "),
                         Span::styled(url, Style::default().fg(Color::Cyan)),
                     ]);
-                    let line1 = Line::from(parts);
+                    let mut line1 = Line::from(parts);
+                    if flagged_reason.is_some() {
+                        line1 = line1.style(Style::default().add_modifier(Modifier::CROSSED_OUT));
+                    }
 
                     // Second line: link
-                    let line2 = Line::from(vec![
+                    let mut line2 = Line::from(vec![
                         Span::styled(format!("    {}.", link), Style::default().fg(Color::LightMagenta)),
                     ]);
+                    if flagged_reason.is_some() {
+                        line2 = line2.style(Style::default().add_modifier(Modifier::CROSSED_OUT));
+                    }
 
                     ListItem::new(vec![line1, line2])
                 })
@@ -1091,6 +1117,7 @@ async fn main() -> Result<()> {
                                         match pi_report_problematic(feed_id, reason_code).await {
                                             Ok(desc) => {
                                                 let _ = ui_tx2.send(UiMsg::Status(format!("Problematic reported: {}", desc)));
+                                                let _ = ui_tx2.send(UiMsg::FlagApplied(feed_id, reason_code));
                                                 let _ = poll_for_new_feeds(tx2).await;
                                             }
                                             Err(e) => {
@@ -1115,6 +1142,7 @@ async fn main() -> Result<()> {
                                         match pi_report_problematic(feed_id, reason_code).await {
                                             Ok(desc) => {
                                                 let _ = ui_tx2.send(UiMsg::Status(format!("Problematic reported: {}", desc)));
+                                                let _ = ui_tx2.send(UiMsg::FlagApplied(feed_id, reason_code));
                                                 let _ = poll_for_new_feeds(tx2).await;
                                             }
                                             Err(e) => {
@@ -1818,6 +1846,7 @@ enum UiMsg {
     EqEnd,
     XmlReady(String),
     XmlError(String),
+    FlagApplied(u64, u8),
 }
 
 async fn fetch_feed_xml(feed_url: String, tx: mpsc::UnboundedSender<UiMsg>) -> Result<()> {
