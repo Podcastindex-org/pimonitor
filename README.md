@@ -16,6 +16,14 @@ allows rudimentary analysis of them.  This is a work in progress.
 ## Features / Options
 * `--config` command-line flag to allow pimonitor to read configuration from a custom file path instead of the default `pimonitor.yaml`.
 * `--vim` command-line flag to enable vim mode. Press `?` to show what it does.
+* Audio formats and extensions supported:
+  * `audio/mp4` | `audio/x-m4a` | `audio/aacp` => `.m4a` | `.mp4`
+  * `audio/aac` => `.aac`
+  * `audio/mpeg` => `.mp3`
+  * `audio/ogg` => `.ogg`
+  * `audio/opus` => `.opus`
+  * `audio/wav` | `audio/x-wav` => `.wav`
+  * `audio/flac` => `.flac`
 
 ## Planned features
 - Add a feed
