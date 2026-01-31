@@ -1,5 +1,5 @@
-use sha1::{Digest, Sha1};
 use serde_yaml::Value as YamlValue;
+use sha1::{Digest, Sha1};
 use std::fs::File;
 use std::path::Path;
 
@@ -89,10 +89,7 @@ pub fn find_feed_index_by_query<T: AsRef<str>>(feeds: &[(u64, T)], query: &str) 
         }
     }
     // Word-conjunction search on title
-    let words: Vec<String> = q
-        .split_whitespace()
-        .map(|w| w.to_lowercase())
-        .collect();
+    let words: Vec<String> = q.split_whitespace().map(|w| w.to_lowercase()).collect();
     if words.is_empty() {
         return None;
     }

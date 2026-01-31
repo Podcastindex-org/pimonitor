@@ -1,26 +1,34 @@
 use std::io::IsTerminal as _; // for stdout().is_terminal()
-use std::time::Duration;
-use std::{fs::File, path::{Path, PathBuf}};
 use std::io::{Cursor, Read};
+use std::time::Duration;
+use std::{
+    fs::File,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Result;
 use chrono::{DateTime, Local};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use once_cell::sync::Lazy;
+use pimonitor::{find_feed_index_by_query, reason_code_for_index, reason_options};
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{BarChart, Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
-use ratatui::Terminal;
+use rodio::{OutputStream, Sink};
+use rustfft::{FftPlanner, num_complex::Complex32};
 use serde::Deserialize;
 use serde_json::Value;
-use xml::reader::EventReader as XmlReader;
-use xml::reader::XmlEvent;
-use xml::writer::{EmitterConfig as XmlEmitterConfig, EventWriter as XmlWriter, XmlEvent as WriterXmlEvent};
-use rodio::{OutputStream, Sink};
-use rustfft::{num_complex::Complex32, FftPlanner};
+use sha1::{Digest, Sha1};
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use symphonia::core::audio::{AudioBufferRef, Signal};
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
@@ -31,12 +39,11 @@ use symphonia::core::probe::Hint;
 use symphonia::default::get_probe;
 use tokio::sync::mpsc;
 use tokio::time::interval;
-use once_cell::sync::Lazy;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
-use sha1::{Sha1, Digest};
-use pimonitor::{reason_options, reason_code_for_index, find_feed_index_by_query};
-use std::collections::{HashMap, HashSet};
+use xml::reader::EventReader as XmlReader;
+use xml::reader::XmlEvent;
+use xml::writer::{
+    EmitterConfig as XmlEmitterConfig, EventWriter as XmlWriter, XmlEvent as WriterXmlEvent,
+};
 
 // Global configuration flags populated from pimonitor.yaml
 // Default polling interval is 60 seconds
@@ -44,7 +51,8 @@ static POLL_INTERVAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(60));
 // Whether both API key and secret are present (read/write possible)
 static PI_READ_WRITE: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
 // Path to the config file (default: pimonitor.yaml, can be overridden with --config)
-static CONFIG_PATH: Lazy<Mutex<PathBuf>> = Lazy::new(|| Mutex::new(PathBuf::from("pimonitor.yaml")));
+static CONFIG_PATH: Lazy<Mutex<PathBuf>> =
+    Lazy::new(|| Mutex::new(PathBuf::from("pimonitor.yaml")));
 
 #[derive(Debug, Deserialize)]
 struct AppConfig {
@@ -91,7 +99,7 @@ fn read_yaml_config() {
     } else {
         PathBuf::from("pimonitor.yaml")
     };
-    
+
     let mut interval_secs: u64 = 60; // default
     let mut can_rw = false; // default to false unless both present
 
@@ -121,10 +129,7 @@ fn read_yaml_config() {
 fn ensure_config_exists_at(path: &Path) -> Result<()> {
     if !path.exists() {
         // Create with blank values for keys. poll_interval is optional and omitted by default.
-        let default_yaml = concat!(
-            "pi_api_key: \"\"\n",
-            "pi_api_secret: \"\"\n",
-        );
+        let default_yaml = concat!("pi_api_key: \"\"\n", "pi_api_secret: \"\"\n",);
         std::fs::write(path, default_yaml)?;
     }
     Ok(())
@@ -199,7 +204,11 @@ mod tests {
         let p = dir.path().join("pimonitor.yaml");
         // Pre-create with custom content
         let mut f = File::create(&p).expect("create file");
-        write!(f, "pi_api_key: \"abc\"\npi_api_secret: \"def\"\npoll_interval: 45\n").unwrap();
+        write!(
+            f,
+            "pi_api_key: \"abc\"\npi_api_secret: \"def\"\npoll_interval: 45\n"
+        )
+        .unwrap();
         drop(f);
         let before = fs::read_to_string(&p).unwrap();
         ensure_config_exists_at(&p).expect("no overwrite");
@@ -215,10 +224,10 @@ mod tests {
         let mut f = File::create(&p).expect("create file");
         write!(f, "pi_api_key: \"test\"\npi_api_secret: \"test\"\n").unwrap();
         drop(f);
-        
+
         // Verify file exists
         assert!(p.exists());
-        
+
         // Verify file is readable
         let contents = fs::read(&p);
         assert!(contents.is_ok());
@@ -229,7 +238,7 @@ mod tests {
     fn config_path_nonexistent_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let p = dir.path().join("nonexistent.yaml");
-        
+
         // Verify file does not exist
         assert!(!p.exists());
     }
@@ -241,7 +250,7 @@ mod tests {
         let mut f = File::create(&p).expect("create file");
         write!(f, "pi_api_key: \"my_key\"\npi_api_secret: \"my_secret\"\n").unwrap();
         drop(f);
-        
+
         let creds = load_pi_creds_from(&p);
         assert!(creds.is_some());
         let (key, secret) = creds.unwrap();
@@ -256,7 +265,7 @@ mod tests {
         let mut f = File::create(&p).expect("create file");
         write!(f, "pi_api_key: \"my_key\"\npi_api_secret: \"\"\n").unwrap();
         drop(f);
-        
+
         let creds = load_pi_creds_from(&p);
         // Should return None because secret is empty
         assert!(creds.is_none());
@@ -315,7 +324,7 @@ struct AppState {
     feeds: Vec<Feed>,
     scroll: usize,
     selected: usize,
-    last_updated: Option<DateTime<Local>>, 
+    last_updated: Option<DateTime<Local>>,
     source: DataSource,
     status_msg: String,
     show_popup: bool,
@@ -399,7 +408,11 @@ impl AppState {
             .as_ref()
             .map(|s| !s.is_paused())
             .unwrap_or(false)
-            && self.audio_sink.as_ref().map(|s| !s.empty()).unwrap_or(false)
+            && self
+                .audio_sink
+                .as_ref()
+                .map(|s| !s.empty())
+                .unwrap_or(false)
     }
 
     fn stop_playback(&mut self) {
@@ -448,7 +461,7 @@ async fn main() -> Result<()> {
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
     let vim_mode = args.iter().any(|arg| arg == "--vim");
-    
+
     // Parse --config flag for custom config file path
     let config_path = if let Some(pos) = args.iter().position(|arg| arg == "--config") {
         if pos + 1 < args.len() {
@@ -494,8 +507,15 @@ async fn main() -> Result<()> {
     }
 
     // Create default config file on startup if missing (only for default path)
-    if config_path.file_name().map(|f| f == "pimonitor.yaml").unwrap_or(false) &&
-       config_path.parent().map(|p| p.as_os_str().is_empty() || p == Path::new(".")).unwrap_or(true) {
+    if config_path
+        .file_name()
+        .map(|f| f == "pimonitor.yaml")
+        .unwrap_or(false)
+        && config_path
+            .parent()
+            .map(|p| p.as_os_str().is_empty() || p == Path::new("."))
+            .unwrap_or(true)
+    {
         let _ = ensure_config_exists();
     }
 
@@ -511,6 +531,8 @@ async fn main() -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<AppUpdate>();
     // UI message channel for async helpers like playback
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiMsg>();
+    // Shutdown signal for background tasks
+    let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
     let mut app = AppState::new(vim_mode);
 
     // Note: We rely on in-app quit (e.g., 'q') to perform graceful cleanup.
@@ -523,7 +545,9 @@ async fn main() -> Result<()> {
         // Initial configuration load and ticker creation
         read_yaml_config();
         let mut current_secs = POLL_INTERVAL.load(Ordering::Relaxed);
-        if current_secs <= 30 { current_secs = 60; }
+        if current_secs <= 30 {
+            current_secs = 60;
+        }
         let mut ticker = interval(Duration::from_secs(current_secs));
         // First immediate fetch without waiting
         if let Err(e) = poll_for_new_feeds(tx_clone.clone()).await {
@@ -532,18 +556,25 @@ async fn main() -> Result<()> {
             let _ = tx_clone.send(st);
         }
         loop {
-            // Read config right before each polling interval starts
-            read_yaml_config();
-            let new_secs = POLL_INTERVAL.load(Ordering::Relaxed);
-            if new_secs != current_secs {
-                current_secs = if new_secs > 30 { new_secs } else { 60 };
-                ticker = interval(Duration::from_secs(current_secs));
-            }
-            ticker.tick().await;
-            if let Err(e) = poll_for_new_feeds(tx_clone.clone()).await {
-                let mut st = AppUpdate::new();
-                st.status_msg = format!("Fetch failed: {}", e);
-                let _ = tx_clone.send(st);
+            tokio::select! {
+                _ = shutdown_rx.recv() => {
+                    // Shutdown signal received, exit the loop
+                    break;
+                }
+                _ = ticker.tick() => {
+                    // Read config right before each polling interval starts
+                    read_yaml_config();
+                    let new_secs = POLL_INTERVAL.load(Ordering::Relaxed);
+                    if new_secs != current_secs {
+                        current_secs = if new_secs > 30 { new_secs } else { 60 };
+                        ticker = interval(Duration::from_secs(current_secs));
+                    }
+                    if let Err(e) = poll_for_new_feeds(tx_clone.clone()).await {
+                        let mut st = AppUpdate::new();
+                        st.status_msg = format!("Fetch failed: {}", e);
+                        let _ = tx_clone.send(st);
+                    }
+                }
             }
         }
     });
@@ -558,8 +589,8 @@ async fn main() -> Result<()> {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(1),        // list
-                Constraint::Length(4),     // status (2 inner lines; +2 borders)
+                Constraint::Min(1),    // list
+                Constraint::Length(4), // status (2 inner lines; +2 borders)
             ])
             .split(term_rect);
         // Account for list block borders (top+bottom) when computing visible rows.
@@ -573,10 +604,7 @@ async fn main() -> Result<()> {
             // Merge: replace data and status, keep scroll if possible
             let scroll = app.scroll;
             let selected = app.selected;
-            let prev_selected_id = app
-                .feeds
-                .get(selected)
-                .and_then(|f| f.id);
+            let prev_selected_id = app.feeds.get(selected).and_then(|f| f.id);
             // Preserve audio state across data updates
             let audio_stream = app.audio_stream.take();
             let audio_sink = app.audio_sink.take();
@@ -604,11 +632,7 @@ async fn main() -> Result<()> {
             app.source = new_state.source;
             app.status_msg = new_state.status_msg;
             // Re-add any flagged feeds that disappeared from API response, trying to maintain position
-            let current_ids: HashSet<u64> = app
-                .feeds
-                .iter()
-                .filter_map(|f| f.id)
-                .collect();
+            let current_ids: HashSet<u64> = app.feeds.iter().filter_map(|f| f.id).collect();
             for (original_idx, feed) in flagged_feeds_with_index {
                 if !current_ids.contains(&feed.id.unwrap_or(0)) {
                     // Insert at original position (clamped to current list length)
@@ -622,7 +646,8 @@ async fn main() -> Result<()> {
                 for f in app.feeds.iter() {
                     if let Some(id) = f.id {
                         if !prev_ids.contains(&id) {
-                            app.new_feed_marks.insert(id, now + std::time::Duration::from_secs(60));
+                            app.new_feed_marks
+                                .insert(id, now + std::time::Duration::from_secs(60));
                         }
                     }
                 }
@@ -630,8 +655,7 @@ async fn main() -> Result<()> {
             // Clamp preserved scroll so the last item remains visible when list shrinks.
             let len = app.feeds.len();
             let new_selected = if let Some(id) = prev_selected_id {
-                app
-                    .feeds
+                app.feeds
                     .iter()
                     .position(|f| f.id == Some(id))
                     .unwrap_or_else(|| selected.min(len.saturating_sub(1)))
@@ -752,10 +776,7 @@ async fn main() -> Result<()> {
         }
 
         // Also clamp scroll on window resizes (no new state), to keep last item visible.
-        let max_scroll_now = app
-            .feeds
-            .len()
-            .saturating_sub(viewport_items);
+        let max_scroll_now = app.feeds.len().saturating_sub(viewport_items);
         if app.scroll > max_scroll_now {
             app.scroll = max_scroll_now;
         }
@@ -773,7 +794,6 @@ async fn main() -> Result<()> {
             let now = std::time::Instant::now();
             app.new_feed_marks.retain(|_, exp| *exp > now);
 
-            
             // Render scrolling by using a viewport via Paragraph/List with offset isn't native; we can slice
             let visible = if app.scroll < app.feeds.len() {
                 &app.feeds[app.scroll..]
@@ -810,44 +830,35 @@ async fn main() -> Result<()> {
                                 .map(|(label, _)| label)
                         });
 
-                    let mut parts = Vec::new();
-                    if is_new_mark { parts.push(Span::styled("*", Style::default().fg(Color::Green))); parts.push(Span::raw(" ")); }
-                    
-                    parts.push(Span::styled(format!("{}.", id_str), Style::default().fg(Color::Yellow)));
-                    parts.push(Span::raw(" "));
-                    
-                    // Build crossed-out portion: flag label (if any) + title + language + url
-                    let mut crossed_parts = Vec::new();
-                    if let Some(label) = reason_label {
-                        crossed_parts.push(Span::styled(
-                            format!("[FLAG {}] ", label),
-                            Style::default().fg(Color::Red),
-                        ));
-                    }
-                    crossed_parts.extend_from_slice(&[
-                        Span::styled(title, Style::default().add_modifier(Modifier::BOLD)),
-                        Span::styled(format!(" ({})", lang_str), Style::default().fg(Color::LightMagenta)),
-                        Span::raw(" - "),
-                        Span::styled(url, Style::default().fg(Color::Cyan)),
-                    ]);
+                            let mut parts = Vec::new();
+                            if is_new_mark { parts.push(Span::styled("*", Style::default().fg(Color::Green))); parts.push(Span::raw(" ")); }
 
-                    if flagged_reason.is_some() {
-                        // Apply struck-out style to the crossed-out parts
-                        let crossed_line = Line::from(crossed_parts)
-                            .style(Style::default().add_modifier(Modifier::CROSSED_OUT));
-                        parts.extend(crossed_line.spans);
-                    } else {
-                        parts.extend(crossed_parts);
-                    }
+                            parts.push(Span::styled(format!("{}.", id_str), Style::default().fg(Color::Yellow)));
+                            parts.push(Span::raw(" "));
+
+                            // Build crossed-out portion: flag label (if any) + title + language + url
+                            let mut crossed_parts = Vec::new();
+                            if let Some(label) = reason_label {
+                                crossed_parts.push(Span::styled(
+                                    format!("[FLAG {}] ", label),
+                                    Style::default().fg(Color::Red),
+                                ));
+                            }
+                            crossed_parts.extend_from_slice(&[
+                                Span::styled(title, Style::default().add_modifier(Modifier::BOLD)),
+                                Span::styled(format!(" ({})", lang_str), Style::default().fg(Color::LightMagenta)),
+                                Span::raw(" - "),
+                                Span::styled(url, Style::default().fg(Color::Cyan)),
+                            ]);
+
+                            parts.extend(crossed_parts);
                     let line1 = Line::from(parts);
 
                     // Second line: link
-                    let mut line2 = Line::from(vec![
+                    let line2 = Line::from(vec![
                         Span::styled(format!("    {}.", link), Style::default().fg(Color::LightMagenta)),
                     ]);
-                    if flagged_reason.is_some() {
-                        line2 = line2.style(Style::default().add_modifier(Modifier::CROSSED_OUT));
-                    }
+                    // Keep flagged label but no strike-through styling
 
                     ListItem::new(vec![line1, line2])
                 })
@@ -906,7 +917,7 @@ async fn main() -> Result<()> {
                         let elapsed = total_elapsed.as_secs();
                         let minutes = elapsed / 60;
                         let seconds = elapsed % 60;
-                        
+
                         let duration_str = if app.vim_mode {
                             if let Some(d) = app.playing_duration {
                                 let total_secs = d.as_secs();
@@ -1061,6 +1072,9 @@ async fn main() -> Result<()> {
                     Line::from(Span::styled("Navigation:", Style::default().add_modifier(Modifier::BOLD))),
                     Line::from("  j / k       - Move down / up"),
                     Line::from("  h / l       - Jump to beginning / end"),
+                    Line::from("  g / G       - Jump to top / bottom"),
+                    Line::from("  0 / $       - Jump to start / end"),
+                    Line::from("  Ctrl-u / d  - Half-page up / down"),
                     Line::from("  Ctrl-n / p  - Next / previous"),
                     Line::from("  PgUp/PgDn   - Page up / down"),
                     Line::from("  Home/End    - Jump to start / end"),
@@ -1137,6 +1151,11 @@ async fn main() -> Result<()> {
         // Input handling with non-blocking poll
         if event::poll(Duration::from_millis(10))? {
             if let Event::Key(k) = event::read()? {
+                // Quit on 'q' regardless of key kind (Press/Repeat/Release)
+                if matches!(k.code, KeyCode::Char('q')) {
+                    break;
+                }
+
                 if k.kind == KeyEventKind::Press {
                     // Search modal input handling
                     if app.search_modal {
@@ -1157,7 +1176,9 @@ async fn main() -> Result<()> {
                                     let tuples: Vec<(u64, String)> = app
                                         .feeds
                                         .iter()
-                                        .map(|f| (f.id.unwrap_or(0), f.title.clone().unwrap_or_default()))
+                                        .map(|f| {
+                                            (f.id.unwrap_or(0), f.title.clone().unwrap_or_default())
+                                        })
                                         .collect();
                                     if let Some(found) = find_feed_index_by_query(&tuples, &q) {
                                         app.selected = found.min(app.feeds.len().saturating_sub(1));
@@ -1198,24 +1219,36 @@ async fn main() -> Result<()> {
                                 app.status_msg = "Canceled problematic report".into();
                             }
                             KeyCode::Up => {
-                                if app.reason_index > 0 { app.reason_index -= 1; }
+                                if app.reason_index > 0 {
+                                    app.reason_index -= 1;
+                                }
                             }
                             KeyCode::Down => {
                                 // Clamp to last index of reasons list
                                 let last = reason_options().len().saturating_sub(1);
-                                if app.reason_index < last { app.reason_index += 1; }
+                                if app.reason_index < last {
+                                    app.reason_index += 1;
+                                }
                             }
                             KeyCode::Char('j') if app.vim_mode => {
                                 let last = reason_options().len().saturating_sub(1);
-                                if app.reason_index < last { app.reason_index += 1; }
+                                if app.reason_index < last {
+                                    app.reason_index += 1;
+                                }
                             }
                             KeyCode::Char('k') if app.vim_mode => {
-                                if app.reason_index > 0 { app.reason_index -= 1; }
+                                if app.reason_index > 0 {
+                                    app.reason_index -= 1;
+                                }
                             }
                             // Direct numeric selection (0-6) per AGENTS.md
-                            KeyCode::Char('0') | KeyCode::Char('1') | KeyCode::Char('2') |
-                            KeyCode::Char('3') | KeyCode::Char('4') | KeyCode::Char('5') |
-                            KeyCode::Char('6') => {
+                            KeyCode::Char('0')
+                            | KeyCode::Char('1')
+                            | KeyCode::Char('2')
+                            | KeyCode::Char('3')
+                            | KeyCode::Char('4')
+                            | KeyCode::Char('5')
+                            | KeyCode::Char('6') => {
                                 if let Some(feed_id) = app.pending_problem_feed_id.take() {
                                     // Map char to index and submit immediately
                                     let idx = match k.code {
@@ -1231,19 +1264,29 @@ async fn main() -> Result<()> {
                                     app.reason_index = idx;
                                     app.reason_modal = false;
                                     let reason_code: u8 = reason_code_for_index(idx);
-                                    app.status_msg = format!("Reporting feed {} as problematic (reason {})…", feed_id, reason_code);
+                                    app.status_msg = format!(
+                                        "Reporting feed {} as problematic (reason {})…",
+                                        feed_id, reason_code
+                                    );
                                     let ui_tx2 = ui_tx.clone();
                                     let tx2 = tx.clone();
                                     tokio::spawn(async move {
                                         match pi_report_problematic(feed_id, reason_code).await {
                                             Ok(desc) => {
-                                                let _ = ui_tx2.send(UiMsg::Status(format!("Problematic reported: {}", desc)));
-                                                let _ = ui_tx2.send(UiMsg::FlagApplied(feed_id, reason_code));
+                                                let _ = ui_tx2.send(UiMsg::Status(format!(
+                                                    "Problematic reported: {}",
+                                                    desc
+                                                )));
+                                                let _ = ui_tx2
+                                                    .send(UiMsg::FlagApplied(feed_id, reason_code));
                                                 let _ = poll_for_new_feeds(tx2).await;
                                             }
                                             Err(e) => {
                                                 eprintln!("Problematic report failed: {}", e);
-                                                let _ = ui_tx2.send(UiMsg::Status(format!("Report failed: {}", e)));
+                                                let _ = ui_tx2.send(UiMsg::Status(format!(
+                                                    "Report failed: {}",
+                                                    e
+                                                )));
                                             }
                                         }
                                     });
@@ -1256,19 +1299,29 @@ async fn main() -> Result<()> {
                                     app.reason_modal = false;
                                     let sel = app.reason_index;
                                     let reason_code: u8 = reason_code_for_index(sel);
-                                    app.status_msg = format!("Reporting feed {} as problematic (reason {})…", feed_id, reason_code);
+                                    app.status_msg = format!(
+                                        "Reporting feed {} as problematic (reason {})…",
+                                        feed_id, reason_code
+                                    );
                                     let ui_tx2 = ui_tx.clone();
                                     let tx2 = tx.clone();
                                     tokio::spawn(async move {
                                         match pi_report_problematic(feed_id, reason_code).await {
                                             Ok(desc) => {
-                                                let _ = ui_tx2.send(UiMsg::Status(format!("Problematic reported: {}", desc)));
-                                                let _ = ui_tx2.send(UiMsg::FlagApplied(feed_id, reason_code));
+                                                let _ = ui_tx2.send(UiMsg::Status(format!(
+                                                    "Problematic reported: {}",
+                                                    desc
+                                                )));
+                                                let _ = ui_tx2
+                                                    .send(UiMsg::FlagApplied(feed_id, reason_code));
                                                 let _ = poll_for_new_feeds(tx2).await;
                                             }
                                             Err(e) => {
                                                 eprintln!("Problematic report failed: {}", e);
-                                                let _ = ui_tx2.send(UiMsg::Status(format!("Report failed: {}", e)));
+                                                let _ = ui_tx2.send(UiMsg::Status(format!(
+                                                    "Report failed: {}",
+                                                    e
+                                                )));
                                             }
                                         }
                                     });
@@ -1288,7 +1341,6 @@ async fn main() -> Result<()> {
                             app.search_input.clear();
                             app.status_msg = "Search…".into();
                         }
-                        KeyCode::Char('q') => break,
                         // Vim mode ? for help
                         KeyCode::Char('?') if app.vim_mode => {
                             app.help_modal = !app.help_modal;
@@ -1317,7 +1369,7 @@ async fn main() -> Result<()> {
                                 let selected_feed_url = feed.url.clone();
                                 // Check if we're playing the currently selected feed
                                 let is_same_feed = app.playing_feed_id == selected_feed_id;
-                                
+
                                 if is_same_feed && app.audio_sink.is_some() {
                                     // Same feed - toggle pause/resume
                                     if let Some(sink) = &app.audio_sink {
@@ -1364,7 +1416,8 @@ async fn main() -> Result<()> {
                                 } else {
                                     centered_rect(70, 60, term_rect)
                                 };
-                                let visible_rows: usize = modal_area.height.saturating_sub(2) as usize;
+                                let visible_rows: usize =
+                                    modal_area.height.saturating_sub(2) as usize;
                                 if app.xml_show {
                                     let max_scroll = {
                                         let lines = app.xml_text.lines().count();
@@ -1378,7 +1431,9 @@ async fn main() -> Result<()> {
                                         let desc = feed.description.clone().unwrap_or_default();
                                         let lines = desc.lines().count() + 5;
                                         lines.saturating_sub(visible_rows)
-                                    } else { 0 };
+                                    } else {
+                                        0
+                                    };
                                     let next = (app.popup_scroll as usize + 1).min(max_scroll);
                                     app.popup_scroll = next as u16;
                                 }
@@ -1400,7 +1455,8 @@ async fn main() -> Result<()> {
                                 } else {
                                     centered_rect(70, 60, term_rect)
                                 };
-                                let visible_rows: usize = modal_area.height.saturating_sub(2) as usize;
+                                let visible_rows: usize =
+                                    modal_area.height.saturating_sub(2) as usize;
                                 if app.xml_show {
                                     let max_scroll = {
                                         let lines = app.xml_text.lines().count();
@@ -1418,7 +1474,9 @@ async fn main() -> Result<()> {
                                         let desc = feed.description.clone().unwrap_or_default();
                                         let lines = desc.lines().count() + 5;
                                         lines.saturating_sub(visible_rows)
-                                    } else { 0 };
+                                    } else {
+                                        0
+                                    };
                                     if app.popup_scroll > 0 {
                                         app.popup_scroll -= 1;
                                     }
@@ -1438,7 +1496,11 @@ async fn main() -> Result<()> {
                         // Vim mode h for left (acts like Home)
                         KeyCode::Char('h') if app.vim_mode => {
                             if app.xml_show || app.show_popup {
-                                if app.xml_show { app.xml_scroll = 0; } else { app.popup_scroll = 0; }
+                                if app.xml_show {
+                                    app.xml_scroll = 0;
+                                } else {
+                                    app.popup_scroll = 0;
+                                }
                                 continue;
                             }
                             app.selected = 0;
@@ -1452,7 +1514,8 @@ async fn main() -> Result<()> {
                                 } else {
                                     centered_rect(70, 60, term_rect)
                                 };
-                                let visible_rows: usize = modal_area.height.saturating_sub(2) as usize;
+                                let visible_rows: usize =
+                                    modal_area.height.saturating_sub(2) as usize;
                                 if app.xml_show {
                                     let max_scroll = {
                                         let lines = app.xml_text.lines().count();
@@ -1465,18 +1528,179 @@ async fn main() -> Result<()> {
                                         let desc = feed.description.clone().unwrap_or_default();
                                         let lines = desc.lines().count() + 5;
                                         lines.saturating_sub(visible_rows)
-                                    } else { 0 };
+                                    } else {
+                                        0
+                                    };
                                     app.popup_scroll = max_scroll.max(0) as u16;
                                 }
                                 continue;
                             }
                             if !app.feeds.is_empty() {
                                 app.selected = app.feeds.len() - 1;
-                                let max_scroll = app
-                                    .feeds
-                                    .len()
-                                    .saturating_sub(viewport_items);
+                                let max_scroll = app.feeds.len().saturating_sub(viewport_items);
                                 app.scroll = max_scroll;
+                            }
+                        }
+                        // Vim mode g: jump to top
+                        KeyCode::Char('g') if app.vim_mode => {
+                            if app.xml_show || app.show_popup {
+                                // For modals, treat like Home
+                                if app.xml_show {
+                                    app.xml_scroll = 0;
+                                } else {
+                                    app.popup_scroll = 0;
+                                }
+                                continue;
+                            }
+                            app.selected = 0;
+                            app.scroll = 0;
+                        }
+                        // Vim mode G: jump to bottom
+                        KeyCode::Char('G') if app.vim_mode => {
+                            if app.xml_show || app.show_popup {
+                                // For modals, treat like End
+                                let modal_area = if app.xml_show {
+                                    centered_rect(80, 70, term_rect)
+                                } else {
+                                    centered_rect(70, 60, term_rect)
+                                };
+                                let visible_rows: usize =
+                                    modal_area.height.saturating_sub(2) as usize;
+                                if app.xml_show {
+                                    let total_lines = app.xml_text.lines().count() + 2;
+                                    let max_scroll =
+                                        total_lines.saturating_sub(visible_rows) as i32;
+                                    app.xml_scroll = max_scroll.max(0) as u16;
+                                } else {
+                                    let total_lines: usize = 5;
+                                    let max_scroll =
+                                        total_lines.saturating_sub(visible_rows) as i32;
+                                    app.popup_scroll = max_scroll.max(0) as u16;
+                                }
+                                continue;
+                            }
+                            if !app.feeds.is_empty() {
+                                app.selected = app.feeds.len().saturating_sub(1);
+                                let max_scroll = app.feeds.len().saturating_sub(viewport_items);
+                                app.scroll = max_scroll;
+                            }
+                        }
+                        // Vim mode 0: start of list
+                        KeyCode::Char('0') if app.vim_mode => {
+                            if app.xml_show || app.show_popup {
+                                if app.xml_show {
+                                    app.xml_scroll = 0;
+                                } else {
+                                    app.popup_scroll = 0;
+                                }
+                                continue;
+                            }
+                            app.selected = 0;
+                            app.scroll = 0;
+                        }
+                        // Vim mode $: end of list
+                        KeyCode::Char('$') if app.vim_mode => {
+                            if app.xml_show || app.show_popup {
+                                let modal_area = if app.xml_show {
+                                    centered_rect(80, 70, term_rect)
+                                } else {
+                                    centered_rect(70, 60, term_rect)
+                                };
+                                let visible_rows: usize =
+                                    modal_area.height.saturating_sub(2) as usize;
+                                if app.xml_show {
+                                    let total_lines = app.xml_text.lines().count() + 2;
+                                    let max_scroll =
+                                        total_lines.saturating_sub(visible_rows) as i32;
+                                    app.xml_scroll = max_scroll.max(0) as u16;
+                                } else {
+                                    let total_lines: usize = 5;
+                                    let max_scroll =
+                                        total_lines.saturating_sub(visible_rows) as i32;
+                                    app.popup_scroll = max_scroll.max(0) as u16;
+                                }
+                                continue;
+                            }
+                            if !app.feeds.is_empty() {
+                                app.selected = app.feeds.len().saturating_sub(1);
+                                let max_scroll = app.feeds.len().saturating_sub(viewport_items);
+                                app.scroll = max_scroll;
+                            }
+                        }
+                        // Vim mode Ctrl-u: half-page up
+                        KeyCode::Char('u')
+                            if app.vim_mode
+                                && k.modifiers
+                                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                        {
+                            if app.xml_show || app.show_popup {
+                                let modal_area = if app.xml_show {
+                                    centered_rect(80, 70, term_rect)
+                                } else {
+                                    centered_rect(70, 60, term_rect)
+                                };
+                                let visible_rows: usize =
+                                    modal_area.height.saturating_sub(2) as usize;
+                                let step = (visible_rows / 2).max(1) as i32;
+                                if app.xml_show {
+                                    let next = (app.xml_scroll as i32 - step).max(0);
+                                    app.xml_scroll = next as u16;
+                                } else {
+                                    let next = (app.popup_scroll as i32 - step).max(0);
+                                    app.popup_scroll = next as u16;
+                                }
+                                continue;
+                            }
+                            let step = (viewport_items / 2).max(1);
+                            if app.selected >= step {
+                                app.selected -= step;
+                            } else {
+                                app.selected = 0;
+                            }
+                            if app.selected < app.scroll {
+                                app.scroll = app.selected;
+                            }
+                        }
+                        // Vim mode Ctrl-d: half-page down
+                        KeyCode::Char('d')
+                            if app.vim_mode
+                                && k.modifiers
+                                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                        {
+                            if app.xml_show || app.show_popup {
+                                let modal_area = if app.xml_show {
+                                    centered_rect(80, 70, term_rect)
+                                } else {
+                                    centered_rect(70, 60, term_rect)
+                                };
+                                let visible_rows: usize =
+                                    modal_area.height.saturating_sub(2) as usize;
+                                let step = (visible_rows / 2).max(1) as i32;
+                                if app.xml_show {
+                                    let total_lines = app.xml_text.lines().count() + 2;
+                                    let max_scroll =
+                                        total_lines.saturating_sub(visible_rows) as i32;
+                                    let next =
+                                        (app.xml_scroll as i32 + step).min(max_scroll.max(0));
+                                    app.xml_scroll = next as u16;
+                                } else {
+                                    let total_lines: usize = 5;
+                                    let max_scroll =
+                                        total_lines.saturating_sub(visible_rows) as i32;
+                                    let next =
+                                        (app.popup_scroll as i32 + step).min(max_scroll.max(0));
+                                    app.popup_scroll = next as u16;
+                                }
+                                continue;
+                            }
+                            let step = (viewport_items / 2).max(1);
+                            if !app.feeds.is_empty() {
+                                let max_idx = app.feeds.len() - 1;
+                                app.selected = (app.selected + step).min(max_idx);
+                                let bottom = app.scroll + viewport_items;
+                                if app.selected >= bottom {
+                                    app.scroll = app.selected + 1 - viewport_items;
+                                }
                             }
                         }
                         KeyCode::Esc => {
@@ -1504,14 +1728,19 @@ async fn main() -> Result<()> {
                             });
                         }
                         // Ctrl-n for next (vim mode)
-                        KeyCode::Char('n') if app.vim_mode && k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                        KeyCode::Char('n')
+                            if app.vim_mode
+                                && k.modifiers
+                                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                        {
                             if app.xml_show || app.show_popup {
                                 let modal_area = if app.xml_show {
                                     centered_rect(80, 70, term_rect)
                                 } else {
                                     centered_rect(70, 60, term_rect)
                                 };
-                                let visible_rows: usize = modal_area.height.saturating_sub(2) as usize;
+                                let visible_rows: usize =
+                                    modal_area.height.saturating_sub(2) as usize;
                                 if app.xml_show {
                                     let max_scroll = {
                                         let lines = app.xml_text.lines().count();
@@ -1525,7 +1754,9 @@ async fn main() -> Result<()> {
                                         let desc = feed.description.clone().unwrap_or_default();
                                         let lines = desc.lines().count() + 5;
                                         lines.saturating_sub(visible_rows)
-                                    } else { 0 };
+                                    } else {
+                                        0
+                                    };
                                     let next = (app.popup_scroll as usize + 1).min(max_scroll);
                                     app.popup_scroll = next as u16;
                                 }
@@ -1540,14 +1771,19 @@ async fn main() -> Result<()> {
                             }
                         }
                         // Ctrl-p for previous (vim mode)
-                        KeyCode::Char('p') if app.vim_mode && k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                        KeyCode::Char('p')
+                            if app.vim_mode
+                                && k.modifiers
+                                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                        {
                             if app.xml_show || app.show_popup {
                                 let modal_area = if app.xml_show {
                                     centered_rect(80, 70, term_rect)
                                 } else {
                                     centered_rect(70, 60, term_rect)
                                 };
-                                let visible_rows: usize = modal_area.height.saturating_sub(2) as usize;
+                                let visible_rows: usize =
+                                    modal_area.height.saturating_sub(2) as usize;
                                 if app.xml_show {
                                     let max_scroll = {
                                         let lines = app.xml_text.lines().count();
@@ -1565,7 +1801,9 @@ async fn main() -> Result<()> {
                                         let desc = feed.description.clone().unwrap_or_default();
                                         let lines = desc.lines().count() + 5;
                                         lines.saturating_sub(visible_rows)
-                                    } else { 0 };
+                                    } else {
+                                        0
+                                    };
                                     if app.popup_scroll > 0 {
                                         app.popup_scroll -= 1;
                                     }
@@ -1615,7 +1853,8 @@ async fn main() -> Result<()> {
                         KeyCode::Char('d') => {
                             // Mark selected feed as problematic via Podcast Index API
                             if !PI_READ_WRITE.load(Ordering::Relaxed) {
-                                app.status_msg = "Read/write disabled: missing API credentials".into();
+                                app.status_msg =
+                                    "Read/write disabled: missing API credentials".into();
                             } else if let Some(feed) = app.feeds.get(app.selected) {
                                 if let Some(feed_id) = feed.id {
                                     // Open reason selection modal
@@ -1642,7 +1881,8 @@ async fn main() -> Result<()> {
                                 } else {
                                     centered_rect(70, 60, term_rect)
                                 };
-                                let visible_rows: usize = modal_area.height.saturating_sub(2) as usize;
+                                let visible_rows: usize =
+                                    modal_area.height.saturating_sub(2) as usize;
                                 if app.xml_show {
                                     let max_scroll = {
                                         let total_lines = app.xml_text.lines().count() + 2; // blank + hint
@@ -1657,16 +1897,25 @@ async fn main() -> Result<()> {
                                 } else {
                                     let feed_opt = app.feeds.get(app.selected);
                                     let total_lines: usize = if let Some(feed) = feed_opt {
-                                        let title = feed.title.clone().unwrap_or_else(|| "<untitled>".into());
-                                        let desc = feed.description.clone().unwrap_or_else(|| "<no description>".into());
+                                        let title = feed
+                                            .title
+                                            .clone()
+                                            .unwrap_or_else(|| "<untitled>".into());
+                                        let desc = feed
+                                            .description
+                                            .clone()
+                                            .unwrap_or_else(|| "<no description>".into());
                                         // title + blank + desc + blank + hint
                                         let mut n: usize = 4; // two blanks + title + hint
                                         n += 1; // desc line (approx; wrapping not counted)
                                         let _ = title; // silence unused
                                         let _ = desc; // silence unused
                                         n
-                                    } else { 0 };
-                                    let max_scroll = total_lines.saturating_sub(visible_rows) as u16;
+                                    } else {
+                                        0
+                                    };
+                                    let max_scroll =
+                                        total_lines.saturating_sub(visible_rows) as u16;
                                     if app.popup_scroll > 0 {
                                         app.popup_scroll -= 1;
                                     }
@@ -1691,16 +1940,19 @@ async fn main() -> Result<()> {
                                 } else {
                                     centered_rect(70, 60, term_rect)
                                 };
-                                let visible_rows: usize = modal_area.height.saturating_sub(2) as usize;
+                                let visible_rows: usize =
+                                    modal_area.height.saturating_sub(2) as usize;
                                 if app.xml_show {
                                     let total_lines = app.xml_text.lines().count() + 2;
-                                    let max_scroll = total_lines.saturating_sub(visible_rows) as i32;
+                                    let max_scroll =
+                                        total_lines.saturating_sub(visible_rows) as i32;
                                     let next = (app.xml_scroll as i32 + 1).min(max_scroll.max(0));
                                     app.xml_scroll = next as u16;
                                 } else {
                                     // approximate line count
                                     let total_lines: usize = 5; // title + blank + desc(approx1) + blank + hint
-                                    let max_scroll = total_lines.saturating_sub(visible_rows) as i32;
+                                    let max_scroll =
+                                        total_lines.saturating_sub(visible_rows) as i32;
                                     let next = (app.popup_scroll as i32 + 1).min(max_scroll.max(0));
                                     app.popup_scroll = next as u16;
                                 }
@@ -1721,7 +1973,8 @@ async fn main() -> Result<()> {
                                 } else {
                                     centered_rect(70, 60, term_rect)
                                 };
-                                let visible_rows: usize = modal_area.height.saturating_sub(2) as usize;
+                                let visible_rows: usize =
+                                    modal_area.height.saturating_sub(2) as usize;
                                 let step = visible_rows.max(1) as i32;
                                 if app.xml_show {
                                     let next = (app.xml_scroll as i32 - step).max(0);
@@ -1749,17 +2002,22 @@ async fn main() -> Result<()> {
                                 } else {
                                     centered_rect(70, 60, term_rect)
                                 };
-                                let visible_rows: usize = modal_area.height.saturating_sub(2) as usize;
+                                let visible_rows: usize =
+                                    modal_area.height.saturating_sub(2) as usize;
                                 let step = visible_rows.max(1) as i32;
                                 if app.xml_show {
                                     let total_lines = app.xml_text.lines().count() + 2;
-                                    let max_scroll = total_lines.saturating_sub(visible_rows) as i32;
-                                    let next = (app.xml_scroll as i32 + step).min(max_scroll.max(0));
+                                    let max_scroll =
+                                        total_lines.saturating_sub(visible_rows) as i32;
+                                    let next =
+                                        (app.xml_scroll as i32 + step).min(max_scroll.max(0));
                                     app.xml_scroll = next as u16;
                                 } else {
                                     let total_lines: usize = 5; // rough
-                                    let max_scroll = total_lines.saturating_sub(visible_rows) as i32;
-                                    let next = (app.popup_scroll as i32 + step).min(max_scroll.max(0));
+                                    let max_scroll =
+                                        total_lines.saturating_sub(visible_rows) as i32;
+                                    let next =
+                                        (app.popup_scroll as i32 + step).min(max_scroll.max(0));
                                     app.popup_scroll = next as u16;
                                 }
                                 continue;
@@ -1776,7 +2034,11 @@ async fn main() -> Result<()> {
                         }
                         KeyCode::Home => {
                             if app.xml_show || app.show_popup {
-                                if app.xml_show { app.xml_scroll = 0; } else { app.popup_scroll = 0; }
+                                if app.xml_show {
+                                    app.xml_scroll = 0;
+                                } else {
+                                    app.popup_scroll = 0;
+                                }
                                 continue;
                             }
                             app.selected = 0;
@@ -1789,24 +2051,24 @@ async fn main() -> Result<()> {
                                 } else {
                                     centered_rect(70, 60, term_rect)
                                 };
-                                let visible_rows: usize = modal_area.height.saturating_sub(2) as usize;
+                                let visible_rows: usize =
+                                    modal_area.height.saturating_sub(2) as usize;
                                 if app.xml_show {
                                     let total_lines = app.xml_text.lines().count() + 2;
-                                    let max_scroll = total_lines.saturating_sub(visible_rows) as i32;
+                                    let max_scroll =
+                                        total_lines.saturating_sub(visible_rows) as i32;
                                     app.xml_scroll = max_scroll.max(0) as u16;
                                 } else {
                                     let total_lines: usize = 5;
-                                    let max_scroll = total_lines.saturating_sub(visible_rows) as i32;
+                                    let max_scroll =
+                                        total_lines.saturating_sub(visible_rows) as i32;
                                     app.popup_scroll = max_scroll.max(0) as u16;
                                 }
                                 continue;
                             }
                             if !app.feeds.is_empty() {
                                 app.selected = app.feeds.len() - 1;
-                                let max_scroll = app
-                                    .feeds
-                                    .len()
-                                    .saturating_sub(viewport_items);
+                                let max_scroll = app.feeds.len().saturating_sub(viewport_items);
                                 app.scroll = max_scroll;
                             }
                         }
@@ -1822,13 +2084,16 @@ async fn main() -> Result<()> {
     // Ensure playback is stopped and any temp audio file is removed before exiting
     app.stop_playback();
 
+    // Signal background tasks to shut down
+    let _ = shutdown_tx.send(());
+
     // Restore terminal
     disable_raw_mode()?;
     let mut stdout = std::io::stdout();
     stdout.execute(LeaveAlternateScreen)?;
 
-    // Return normally; the Tokio runtime will shut down background tasks.
-    Ok(())
+    // Force exit to ensure all background tasks are terminated immediately
+    std::process::exit(0);
 }
 
 // The main polling function which fetches new feeds from the Podcast Index API.
@@ -1843,7 +2108,8 @@ async fn poll_for_new_feeds(tx: mpsc::UnboundedSender<AppUpdate>) -> Result<()> 
     st.last_updated = Some(Local::now());
     st.source = source;
     st.status_msg = String::from("OK");
-    tx.send(st).map_err(|_| anyhow::anyhow!("failed to send state"))?;
+    tx.send(st)
+        .map_err(|_| anyhow::anyhow!("failed to send state"))?;
     Ok(())
 }
 
@@ -1869,19 +2135,17 @@ async fn pi_get_recent_newfeeds() -> Result<Vec<Feed>> {
     let feeds: Vec<Feed> = api
         .feeds
         .into_iter()
-        .filter(|f| {
-            match &f.dead {
-                None => true,
-                Some(v) => match v {
-                    Value::Bool(b) => !*b,
-                    Value::Number(n) => n.as_i64().map(|i| i == 0).unwrap_or(true),
-                    Value::String(s) => {
-                        let s = s.to_lowercase();
-                        !(s == "1" || s == "true")
-                    }
-                    _ => true,
-                },
-            }
+        .filter(|f| match &f.dead {
+            None => true,
+            Some(v) => match v {
+                Value::Bool(b) => !*b,
+                Value::Number(n) => n.as_i64().map(|i| i == 0).unwrap_or(true),
+                Value::String(s) => {
+                    let s = s.to_lowercase();
+                    !(s == "1" || s == "true")
+                }
+                _ => true,
+            },
         })
         .collect();
 
@@ -1905,10 +2169,7 @@ fn load_pi_creds_from(path: &Path) -> Option<(String, String)> {
                 .map(|s| !s.trim().is_empty())
                 .unwrap_or(false);
             if key_ok && sec_ok {
-                return Some((
-                    cfg.pi_api_key.unwrap(),
-                    cfg.pi_api_secret.unwrap(),
-                ));
+                return Some((cfg.pi_api_key.unwrap(), cfg.pi_api_secret.unwrap()));
             }
         }
     }
@@ -1992,7 +2253,8 @@ async fn fetch_feed_xml(feed_url: String, tx: mpsc::UnboundedSender<UiMsg>) -> R
                     tx.send(UiMsg::XmlReady(pretty)).ok();
                 }
                 Err(e) => {
-                    tx.send(UiMsg::XmlError(format!("failed to read body: {}", e))).ok();
+                    tx.send(UiMsg::XmlError(format!("failed to read body: {}", e)))
+                        .ok();
                 }
             },
             Err(e) => {
@@ -2000,7 +2262,8 @@ async fn fetch_feed_xml(feed_url: String, tx: mpsc::UnboundedSender<UiMsg>) -> R
             }
         },
         Err(e) => {
-            tx.send(UiMsg::XmlError(format!("request failed: {}", e))).ok();
+            tx.send(UiMsg::XmlError(format!("request failed: {}", e)))
+                .ok();
         }
     }
     Ok(())
@@ -2022,7 +2285,9 @@ fn pretty_print_xml(input: &str) -> Result<String> {
 
         for ev in parser {
             match ev {
-                Ok(XmlEvent::StartElement { name, attributes, .. }) => {
+                Ok(XmlEvent::StartElement {
+                    name, attributes, ..
+                }) => {
                     // Clone to owned strings so lifetimes outlive the builder until write.
                     let elem_name = name.local_name.clone();
                     let attrs_owned: Vec<(String, String)> = attributes
@@ -2050,7 +2315,10 @@ fn pretty_print_xml(input: &str) -> Result<String> {
                     writer.write(WriterXmlEvent::comment(&text))?;
                 }
                 Ok(XmlEvent::ProcessingInstruction { name, data }) => {
-                    writer.write(WriterXmlEvent::processing_instruction(&name, data.as_deref()))?;
+                    writer.write(WriterXmlEvent::processing_instruction(
+                        &name,
+                        data.as_deref(),
+                    ))?;
                 }
                 // Ignore other events such as StartDocument/EndDocument/Whitespace to avoid duplicating declarations
                 Ok(_) => {}
@@ -2069,7 +2337,7 @@ fn pretty_print_xml(input: &str) -> Result<String> {
 #[derive(Debug, Clone)]
 struct AppUpdate {
     feeds: Vec<Feed>,
-    last_updated: Option<DateTime<Local>>, 
+    last_updated: Option<DateTime<Local>>,
     source: DataSource,
     status_msg: String,
 }
@@ -2088,7 +2356,13 @@ impl AppUpdate {
 async fn fetch_play_latest(feed_url: String, tx: mpsc::UnboundedSender<UiMsg>) -> Result<()> {
     let client = reqwest::Client::new();
     tx.send(UiMsg::Status("Downloading RSS…".into())).ok();
-    let xml = client.get(&feed_url).send().await?.error_for_status()?.text().await?;
+    let xml = client
+        .get(&feed_url)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
     match extract_latest_enclosure_url(&xml) {
         Some(enclosure_url) => {
             tx.send(UiMsg::Status("Downloading audio…".into())).ok();
@@ -2097,12 +2371,14 @@ async fn fetch_play_latest(feed_url: String, tx: mpsc::UnboundedSender<UiMsg>) -
                     tx.send(UiMsg::PlayReady(path)).ok();
                 }
                 Err(e) => {
-                    tx.send(UiMsg::PlayError(format!("download failed: {}", e))).ok();
+                    tx.send(UiMsg::PlayError(format!("download failed: {}", e)))
+                        .ok();
                 }
             }
         }
         None => {
-            tx.send(UiMsg::PlayError("No enclosure url found".into())).ok();
+            tx.send(UiMsg::PlayError("No enclosure url found".into()))
+                .ok();
         }
     }
     Ok(())
@@ -2117,7 +2393,9 @@ fn extract_latest_enclosure_url(xml: &str) -> Option<String> {
 
     for event in parser {
         match event {
-            Ok(XmlEvent::StartElement { name, attributes, .. }) => {
+            Ok(XmlEvent::StartElement {
+                name, attributes, ..
+            }) => {
                 if name.local_name == "item" {
                     in_item = true;
                     saw_any_item = true;
@@ -2226,7 +2504,9 @@ async fn download_to_temp(url: &str) -> Result<PathBuf> {
     }
 
     let mut builder = tempfile::Builder::new();
-    if let Some(suf) = suffix { builder.suffix(suf); }
+    if let Some(suf) = suffix {
+        builder.suffix(suf);
+    }
     let mut tmp = builder.tempfile()?;
 
     while let Some(chunk) = resp.chunk().await? {
@@ -2239,7 +2519,7 @@ async fn download_to_temp(url: &str) -> Result<PathBuf> {
 
 fn start_playback_from_file(path: &PathBuf) -> Result<(OutputStream, Sink)> {
     use std::panic;
-    
+
     // Keep OutputStream alive together with Sink
     let (stream, handle) = OutputStream::try_default()?;
     let sink = Sink::try_new(&handle)?;
@@ -2255,20 +2535,23 @@ fn start_playback_from_file(path: &PathBuf) -> Result<(OutputStream, Sink)> {
     // Set a temporary panic hook that does nothing to suppress panic messages
     let old_hook = panic::take_hook();
     panic::set_hook(Box::new(|_| {}));
-    
-    let decoder_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        rodio::Decoder::new(cursor)
-    }));
-    
+
+    let decoder_result =
+        panic::catch_unwind(panic::AssertUnwindSafe(|| rodio::Decoder::new(cursor)));
+
     // Restore the original panic hook
     panic::set_hook(old_hook);
-    
+
     let decoder = match decoder_result {
         Ok(Ok(dec)) => dec,
         Ok(Err(e)) => return Err(anyhow::anyhow!("Decoder error: {}", e)),
-        Err(_) => return Err(anyhow::anyhow!("Audio decoder panic - this audio format may not be supported")),
+        Err(_) => {
+            return Err(anyhow::anyhow!(
+                "Audio decoder panic - this audio format may not be supported"
+            ));
+        }
     };
-    
+
     sink.append(decoder);
     sink.play();
     Ok((stream, sink))
@@ -2282,23 +2565,28 @@ fn get_duration_from_file(path: &Path) -> Option<Duration> {
         hint.with_extension(ext);
     }
     let probed = get_probe()
-        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
         .ok()?;
     let format = probed.format;
-    
+
     // Select the first audio track
     let track = format
         .tracks()
         .iter()
         .find(|t| t.codec_params.sample_rate.is_some())?;
-        
+
     let params = &track.codec_params;
-    
+
     if let (Some(n_frames), Some(tb)) = (params.n_frames, params.time_base) {
         let time = tb.calc_time(n_frames);
         return Some(Duration::from_secs(time.seconds) + Duration::from_secs_f64(time.frac));
     }
-    
+
     None
 }
 
@@ -2325,8 +2613,13 @@ fn analyze_file_eq(path: PathBuf, tx: mpsc::UnboundedSender<UiMsg>) -> Result<()
         hint.with_extension(ext);
     }
     let probed = get_probe()
-        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
-    .map_err(|e| anyhow::anyhow!("probe error: {}", e))?;
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(|e| anyhow::anyhow!("probe error: {}", e))?;
     let mut format = probed.format;
 
     // Select the first audio track

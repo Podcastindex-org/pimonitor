@@ -14,7 +14,7 @@
 //! - A sanity check that using an in-memory `Cursor<Vec<u8>>` (our workaround)
 //!   does not panic (it may return a decode error for invalid data, but must not panic).
 
-use std::io::{Read, Seek, SeekFrom, Error as IoError, ErrorKind};
+use std::io::{Error as IoError, ErrorKind, Read, Seek, SeekFrom};
 use std::panic;
 
 /// A reader that can provide bytes but always fails any seek operation.
@@ -26,7 +26,10 @@ struct PoisonSeek {
 
 impl PoisonSeek {
     fn new(size: usize) -> Self {
-        Self { buf: vec![0u8; size], pos: 0 }
+        Self {
+            buf: vec![0u8; size],
+            pos: 0,
+        }
     }
 }
 
@@ -56,7 +59,10 @@ fn rodio_decoder_panics_when_seek_errors_during_init() {
         let _decoder = rodio::Decoder::new(reader).expect("Decoder unexpectedly did not panic");
     });
 
-    assert!(result.is_err(), "Expected a panic when seek fails during decoder init");
+    assert!(
+        result.is_err(),
+        "Expected a panic when seek fails during decoder init"
+    );
 }
 
 #[test]
@@ -70,5 +76,8 @@ fn rodio_decoder_with_cursor_does_not_panic() {
         let _ = rodio::Decoder::new(cursor); // Should not panic; may return Err
     });
 
-    assert!(result.is_ok(), "Decoder creation with Cursor should not panic");
+    assert!(
+        result.is_ok(),
+        "Decoder creation with Cursor should not panic"
+    );
 }

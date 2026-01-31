@@ -1,5 +1,5 @@
-use pimonitor::{reason_options, reason_code_for_index, build_pi_auth_headers};
-use sha1::{Sha1, Digest};
+use pimonitor::{build_pi_auth_headers, reason_code_for_index, reason_options};
+use sha1::{Digest, Sha1};
 
 #[test]
 fn reason_options_match_agents_md_order_and_codes() {
@@ -7,15 +7,18 @@ fn reason_options_match_agents_md_order_and_codes() {
     let labels: Vec<&str> = opts.iter().map(|(l, _)| *l).collect();
     let codes: Vec<u8> = opts.iter().map(|(_, c)| *c).collect();
 
-    assert_eq!(labels, vec![
-        "No Reason",
-        "Spam",
-        "AI Slop",
-        "Illegal Content",
-        "Duplicate",
-        "Malicious Payload",
-        "Feed Hijack",
-    ]);
+    assert_eq!(
+        labels,
+        vec![
+            "No Reason",
+            "Spam",
+            "AI Slop",
+            "Illegal Content",
+            "Duplicate",
+            "Malicious Payload",
+            "Feed Hijack",
+        ]
+    );
 
     assert_eq!(codes, vec![0, 1, 2, 3, 4, 5, 6]);
 }
@@ -23,7 +26,7 @@ fn reason_options_match_agents_md_order_and_codes() {
 #[test]
 fn reason_code_for_index_clamps_and_maps() {
     // In-range indices map correctly
-    for (i, code) in [0u8,1,2,3,4,5,6].iter().enumerate() {
+    for (i, code) in [0u8, 1, 2, 3, 4, 5, 6].iter().enumerate() {
         assert_eq!(reason_code_for_index(i), *code);
     }
     // Out of range clamps to last
